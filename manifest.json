@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "id": "kirikiri.ks",
+      "folder": "kirikiri",
+      "name": "KiriKiri (.ks)",
+      "min_ui_version": "0.7.0",
+      "sha256": ""
+    },
+    
+  ]
+}
