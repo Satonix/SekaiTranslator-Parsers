@@ -16,21 +16,23 @@ extensions = {".ast", ".txt"}
 # Regexes
 # ----------------------------
 
+# text = { ... }  (aceita com ou sem vírgula no final)
 _RE_TEXT_BLOCK = re.compile(
     r"""
     \btext\s*=\s*\{          # text = {
         (?P<body>.*?)        #   ... (non-greedy)
-    \}\s*,                   # },
+    \}\s*,?                  # } ou },
     """,
     re.DOTALL | re.VERBOSE,
 )
 
 def _re_lang_section(lang: str) -> re.Pattern:
+    # <lang> = { ... } (aceita com ou sem vírgula no final)
     return re.compile(
         rf"""
         \b{re.escape(lang)}\s*=\s*\{{     # <lang> = {{
             (?P<body>.*?)                 #   ...
-        \}}\s*,                           # }},
+        \}}\s*,?                          # }} ou }},
         """,
         re.DOTALL | re.VERBOSE,
     )
@@ -42,8 +44,15 @@ _RE_LANG_KEYS = re.compile(
     re.VERBOSE,
 )
 
-_RE_STRING = re.compile(
-    r'"(?P<s>(?:[^"\\]|\\.)*)"',  # " ... " with escapes
+# "..." (com escapes)
+_RE_QUOTED = re.compile(
+    r'"(?P<s>(?:[^"\\]|\\.)*)"',
+    re.DOTALL,
+)
+
+# [[...]] (Lua long string simples)
+_RE_LONG = re.compile(
+    r"\[\[(?P<s>.*?)\]\]",
     re.DOTALL,
 )
 
@@ -52,20 +61,26 @@ _RE_STRING = re.compile(
 # Escapes
 # ----------------------------
 
-def _unescape_lua(s: str) -> str:
-    # best-effort
+def _unescape_lua_quoted(s: str) -> str:
+    # best-effort para \" \\ \n
     try:
         return bytes(s, "utf-8").decode("unicode_escape")
     except Exception:
         return s.replace(r"\\", "\\").replace(r"\"", '"').replace(r"\n", "\n")
 
 
-def _escape_lua(s: str) -> str:
+def _escape_lua_quoted(s: str) -> str:
     s = s.replace("\\", r"\\")
     s = s.replace('"', r"\"")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.replace("\n", r"\n")
     return s
+
+
+def _escape_lua_long(s: str) -> str:
+    # Long string não usa escapes; só evita fechar acidentalmente ]]
+    # fallback simples: se contiver ]], troca por ]\]
+    return s.replace("]]", r"]\]")
 
 
 # ----------------------------
@@ -99,7 +114,6 @@ def _pick_lang_for_textblock(text_body: str, preferred: str) -> str:
         k = (m.group("key") or "").strip()
         if not k:
             continue
-        # chaves que não são idiomas
         if k in {"vo", "pagebreak"}:
             continue
         keys.append(k)
@@ -116,10 +130,31 @@ def _pick_lang_for_textblock(text_body: str, preferred: str) -> str:
     return preferred or "ja"
 
 
+def _iter_strings_with_offsets(s: str, base_offset: int):
+    """
+    Gera (abs_start, abs_end, original_text, kind)
+    kind: "quoted" -> conteúdo dentro de "..."
+          "long"   -> conteúdo dentro de [[...]]
+    abs_start/abs_end sempre apontam para o CONTEÚDO (sem delimitadores).
+    """
+    # 1) primeiro quoted
+    for m in _RE_QUOTED.finditer(s):
+        raw = m.group("s")
+        yield (base_offset + m.start("s"), base_offset + m.end("s"), _unescape_lua_quoted(raw), "quoted")
+
+    # 2) long strings
+    for m in _RE_LONG.finditer(s):
+        raw = m.group("s")
+        # long string mantém literal, só normaliza quebras
+        original = raw.replace("\r\n", "\n").replace("\r", "\n")
+        yield (base_offset + m.start("s"), base_offset + m.end("s"), original, "long")
+
+
 def _extract_replacements(entries: List[dict]) -> List[Tuple[int, int, str]]:
     """
-    Converte entries -> lista de (start, end, replacement_text_escaped)
-    start/end são offsets absolutos no ctx.original_text do CONTEÚDO dentro das aspas.
+    entries -> (start, end, replacement) onde replacement já vem no formato
+    correto para o tipo original (quoted/long), mas aqui retornamos apenas o
+    conteúdo (sem delimitadores).
     """
     reps: List[Tuple[int, int, str]] = []
     for e in entries or []:
@@ -131,20 +166,26 @@ def _extract_replacements(entries: List[dict]) -> List[Tuple[int, int, str]]:
 
         start = meta.get("abs_start")
         end = meta.get("abs_end")
+        kind = (meta.get("string_kind") or "quoted").strip()
+
         if not isinstance(start, int) or not isinstance(end, int):
             continue
         if start < 0 or end < 0 or end < start:
             continue
 
-        # decide texto final: translation se tiver, senão original
         tr = e.get("translation")
         if isinstance(tr, str) and tr.strip():
             final_text = tr
         else:
             final_text = e.get("original") if isinstance(e.get("original"), str) else ""
-        reps.append((start, end, _escape_lua(final_text)))
 
-    # importante: substituir de trás pra frente
+        if kind == "long":
+            rep = _escape_lua_long(final_text.replace("\r\n", "\n").replace("\r", "\n"))
+        else:
+            rep = _escape_lua_quoted(final_text)
+
+        reps.append((start, end, rep))
+
     reps.sort(key=lambda t: t[0], reverse=True)
     return reps
 
@@ -161,9 +202,9 @@ class ArtemisParser:
     def detect(self, ctx: ParseContext, text: str) -> float:
         t = text or ""
         score = 0.0
-        if "astver" in t and "astname" in t and "ast =" in t:
+        if "astver" in t and "astname" in t and "ast" in t:
             score += 0.55
-        if "block_" in t and "text =" in t:
+        if "block_" in t and "text" in t:
             score += 0.25
         if re.search(r"\b(ja|en|cn)\s*=\s*\{", t):
             score += 0.20
@@ -187,12 +228,10 @@ class ArtemisParser:
             lang_match = lang_re.search(text_body)
 
             if not lang_match:
-                # fallback explícito extra
-                for fb in ("ja", "en"):
+                for fb in ("ja", "en", "cn"):
                     if fb == lang:
                         continue
-                    fb_re = _re_lang_section(fb)
-                    m2 = fb_re.search(text_body)
+                    m2 = _re_lang_section(fb).search(text_body)
                     if m2:
                         lang_match = m2
                         lang = fb
@@ -204,20 +243,14 @@ class ArtemisParser:
             lang_body = lang_match.group("body")
             lang_body_start = text_body_start + lang_match.start("body")
 
-            for sm in _RE_STRING.finditer(lang_body):
-                raw = sm.group("s")
-                original = _unescape_lua(raw)
-
-                abs_start = lang_body_start + sm.start("s")
-                abs_end = lang_body_start + sm.end("s")
-
+            for abs_start, abs_end, original, kind in _iter_strings_with_offsets(lang_body, lang_body_start):
                 meta = {
                     "format": "artemis_ast_v2",
                     "lang": lang,
+                    "string_kind": kind,  # "quoted" ou "long"
                     "abs_start": abs_start,
                     "abs_end": abs_end,
                 }
-
                 entries.append(_mk_entry(f"artemis:{entry_i}", original, meta))
                 entry_i += 1
 
@@ -235,8 +268,6 @@ class ArtemisParser:
         out = base
         for start, end, rep in reps:
             if end > len(out) or start > len(out):
-                # arquivo mudou de tamanho/offsets inválidos
-                # não aborta tudo, só ignora essa substituição
                 continue
             out = out[:start] + rep + out[end:]
 
