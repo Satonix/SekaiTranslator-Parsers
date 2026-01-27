@@ -8,6 +8,12 @@
       "min_ui_version": "0.7.0",
       "sha256": ""
     },
-    
+    {
+      "id": "artemis.ast",
+      "folder": "artemis",
+      "name": "Artemis AST (.ast/.txt)",
+      "min_ui_version": "0.7.0",
+      "sha256": ""
+    }
   ]
 }
