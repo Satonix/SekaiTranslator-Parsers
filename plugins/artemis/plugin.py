@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
-from parsers.base import ParseContext
+from parsers.base import ParseContext, ParserError
 
 
 plugin_id = "artemis.ast"
@@ -25,7 +25,6 @@ _RE_TEXT_BLOCK = re.compile(
     re.DOTALL | re.VERBOSE,
 )
 
-# captura uma seção genérica: <lang> = { ... },
 def _re_lang_section(lang: str) -> re.Pattern:
     return re.compile(
         rf"""
@@ -36,7 +35,6 @@ def _re_lang_section(lang: str) -> re.Pattern:
         re.DOTALL | re.VERBOSE,
     )
 
-# tenta descobrir chaves de idioma existentes dentro de text = { ... }
 _RE_LANG_KEYS = re.compile(
     r"""
     \b(?P<key>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*\{   # key = {
@@ -50,7 +48,12 @@ _RE_STRING = re.compile(
 )
 
 
+# ----------------------------
+# Escapes
+# ----------------------------
+
 def _unescape_lua(s: str) -> str:
+    # best-effort
     try:
         return bytes(s, "utf-8").decode("unicode_escape")
     except Exception:
@@ -65,6 +68,10 @@ def _escape_lua(s: str) -> str:
     return s
 
 
+# ----------------------------
+# Core helpers
+# ----------------------------
+
 def _mk_entry(entry_id: str, original: str, meta: dict) -> Dict[str, Any]:
     return {
         "entry_id": entry_id,
@@ -78,11 +85,6 @@ def _mk_entry(entry_id: str, original: str, meta: dict) -> Dict[str, Any]:
 
 
 def _get_project_lang(ctx: ParseContext) -> str:
-    """
-    Pega o idioma de origem do projeto.
-    Aceita project['source_language'] ou project['source_lang'].
-    Fallback: 'ja'
-    """
     proj = getattr(ctx, "project", None) or {}
     if isinstance(proj, dict):
         v = (proj.get("source_language") or proj.get("source_lang") or "").strip()
@@ -92,27 +94,17 @@ def _get_project_lang(ctx: ParseContext) -> str:
 
 
 def _pick_lang_for_textblock(text_body: str, preferred: str) -> str:
-    """
-    Decide qual idioma usar dentro de um text = { ... }.
-    Ordem:
-      1) preferred (source_language do projeto)
-      2) 'ja'
-      3) 'en'
-      4) primeiro idioma encontrado no bloco
-    """
-    keys = []
+    keys: List[str] = []
     for m in _RE_LANG_KEYS.finditer(text_body):
         k = (m.group("key") or "").strip()
         if not k:
             continue
-        # ignora sub-blocos que não são idiomas
-        # (vo/pagebreak etc podem aparecer como keys)
+        # chaves que não são idiomas
         if k in {"vo", "pagebreak"}:
             continue
         keys.append(k)
 
     keyset = set(keys)
-
     if preferred in keyset:
         return preferred
     if "ja" in keyset:
@@ -123,6 +115,43 @@ def _pick_lang_for_textblock(text_body: str, preferred: str) -> str:
         return keys[0]
     return preferred or "ja"
 
+
+def _extract_replacements(entries: List[dict]) -> List[Tuple[int, int, str]]:
+    """
+    Converte entries -> lista de (start, end, replacement_text_escaped)
+    start/end são offsets absolutos no ctx.original_text do CONTEÚDO dentro das aspas.
+    """
+    reps: List[Tuple[int, int, str]] = []
+    for e in entries or []:
+        meta = e.get("meta") if isinstance(e, dict) else None
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("format") != "artemis_ast_v2":
+            continue
+
+        start = meta.get("abs_start")
+        end = meta.get("abs_end")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        if start < 0 or end < 0 or end < start:
+            continue
+
+        # decide texto final: translation se tiver, senão original
+        tr = e.get("translation")
+        if isinstance(tr, str) and tr.strip():
+            final_text = tr
+        else:
+            final_text = e.get("original") if isinstance(e.get("original"), str) else ""
+        reps.append((start, end, _escape_lua(final_text)))
+
+    # importante: substituir de trás pra frente
+    reps.sort(key=lambda t: t[0], reverse=True)
+    return reps
+
+
+# ----------------------------
+# Parser
+# ----------------------------
 
 class ArtemisParser:
     plugin_id = plugin_id
@@ -136,16 +165,11 @@ class ArtemisParser:
             score += 0.55
         if "block_" in t and "text =" in t:
             score += 0.25
-        # qualquer presença de ja/en/cn aumenta confiança
         if re.search(r"\b(ja|en|cn)\s*=\s*\{", t):
             score += 0.20
         return min(1.0, score)
 
     def parse(self, ctx: ParseContext, text: str) -> List[dict]:
-        """
-        Extrai strings dentro de text = { ... <lang> = { ... "..." ... }, ... }
-        onde <lang> = source_language do projeto (fallbacks automáticos).
-        """
         entries: List[dict] = []
         if not text:
             return entries
@@ -161,14 +185,16 @@ class ArtemisParser:
 
             lang_re = _re_lang_section(lang)
             lang_match = lang_re.search(text_body)
+
             if not lang_match:
-                # tenta fallback explícito se o chosen não existir por algum motivo
+                # fallback explícito extra
                 for fb in ("ja", "en"):
                     if fb == lang:
                         continue
                     fb_re = _re_lang_section(fb)
-                    lang_match = fb_re.search(text_body)
-                    if lang_match:
+                    m2 = fb_re.search(text_body)
+                    if m2:
+                        lang_match = m2
                         lang = fb
                         break
 
@@ -198,10 +224,23 @@ class ArtemisParser:
         return entries
 
     def rebuild(self, ctx: ParseContext, entries: List[dict]) -> str:
-        raise RuntimeError(
-            "ArtemisParser.rebuild ainda depende do texto base.\n"
-            "Se seu ParseContext já tiver ctx.original_text, eu ajusto para usar isso."
-        )
+        base = getattr(ctx, "original_text", None)
+        if not isinstance(base, str) or not base:
+            raise ParserError("Artemis rebuild requer ctx.original_text (Opção A).")
+
+        reps = _extract_replacements(entries)
+        if not reps:
+            return base
+
+        out = base
+        for start, end, rep in reps:
+            if end > len(out) or start > len(out):
+                # arquivo mudou de tamanho/offsets inválidos
+                # não aborta tudo, só ignora essa substituição
+                continue
+            out = out[:start] + rep + out[end:]
+
+        return out
 
 
 def get_plugin():
