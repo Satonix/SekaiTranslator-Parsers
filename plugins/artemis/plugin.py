@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from parsers.base import ParserPlugin, ParseContext, ParserError
 import re
+from parsers.base import ParseContext
 
 
 class ArtemisParser:
@@ -27,34 +27,49 @@ class ArtemisParser:
 
         entries: list[dict] = []
 
-        # captura blocos text = { ... }
-        for m in re.finditer(r"text\s*=\s*{", text):
-            start = m.end()
-            end = self._find_matching_brace(text, start - 1)
-            if end is None:
+        # Procura por blocos "text = { ... }" dentro do arquivo inteiro
+        for m in re.finditer(r"\btext\s*=\s*{", text):
+            block_open_abs = m.end() - 1  # posição do "{"
+            block_close_abs = self._find_matching_brace(text, block_open_abs)
+            if block_close_abs is None:
                 continue
 
-            block = text[start:end]
+            # conteúdo dentro do { ... } (sem as chaves externas)
+            inner_start_abs = block_open_abs + 1
+            inner_end_abs = block_close_abs
+            block_inner = text[inner_start_abs:inner_end_abs]
 
-            lang_block = self._extract_lang_block(block, src_lang)
-            if not lang_block and src_lang != "ja":
-                lang_block = self._extract_lang_block(block, "ja")
+            # tenta pegar o idioma configurado; se não existir, cai pra ja
+            found = self._extract_lang_strings_abs(
+                full_text=text,
+                block_inner=block_inner,
+                block_inner_start_abs=inner_start_abs,
+                lang=src_lang,
+            )
+            if not found and src_lang != "ja":
+                found = self._extract_lang_strings_abs(
+                    full_text=text,
+                    block_inner=block_inner,
+                    block_inner_start_abs=inner_start_abs,
+                    lang="ja",
+                )
 
-            if not lang_block:
+            if not found:
                 continue
 
-            for s, span in lang_block:
+            for original_str, span_abs in found:
+                # span_abs cobre o token com aspas:  "...."
+                entry_id = f"{inner_start_abs}:{span_abs[0]}:{span_abs[1]}"
                 entries.append({
-                    "entry_id": f"{m.start()}:{span[0]}",
-                    "original": s,
+                    "entry_id": entry_id,
+                    "original": original_str,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
                     "meta": {
-                        "lang": src_lang,
-                        "span": span,
-                        "block_start": start,
-                        "block_end": end,
+                        "span_abs": span_abs,  # (a,b) ABSOLUTO em ctx.original_text
+                        "src_lang": src_lang,
+                        "tgt_lang": tgt_lang,
                     }
                 })
 
@@ -64,58 +79,137 @@ class ArtemisParser:
     # Rebuild
     # --------------------------------------------------
     def rebuild(self, ctx: ParseContext, entries: list[dict]) -> str:
-        text = ctx.original_text
+        out = ctx.original_text
 
-        # aplica de trás pra frente para não quebrar offsets
-        for e in sorted(entries, key=lambda x: x["meta"]["span"][0], reverse=True):
+        # Substitui de trás pra frente para não invalidar offsets
+        def _key(e: dict) -> int:
+            meta = e.get("meta") or {}
+            span = meta.get("span_abs")
+            if isinstance(span, (list, tuple)) and len(span) == 2:
+                return int(span[0])
+            return -1
+
+        for e in sorted(entries, key=_key, reverse=True):
             tr = e.get("translation")
-            if not tr:
+            if not isinstance(tr, str) or not tr.strip():
                 continue
 
-            a, b = e["meta"]["span"]
-            text = text[:a] + f'"{tr}"' + text[b:]
+            meta = e.get("meta") or {}
+            span = meta.get("span_abs")
+            if not (isinstance(span, (list, tuple)) and len(span) == 2):
+                continue
 
-        return text
+            a, b = int(span[0]), int(span[1])
+            if not (0 <= a < b <= len(out)):
+                continue
+
+            # span cobre o token COM aspas: "..."
+            escaped = self._escape_lua_string(tr.strip())
+            out = out[:a] + f"\"{escaped}\"" + out[b:]
+
+        return out
 
     # --------------------------------------------------
     # Helpers
     # --------------------------------------------------
-    def _extract_lang_block(self, block: str, lang: str):
+    def _extract_lang_strings_abs(
+        self,
+        *,
+        full_text: str,
+        block_inner: str,
+        block_inner_start_abs: int,
+        lang: str,
+    ) -> list[tuple[str, tuple[int, int]]]:
         """
-        Retorna lista de (string, (start, end))
+        Encontra o sub-bloco:
+            <lang> = { ... }
+        e retorna lista de:
+            (conteúdo_da_string, (span_abs_inicio, span_abs_fim))
+        onde span_abs cobre o token com aspas no arquivo inteiro.
         """
-        results = []
+        results: list[tuple[str, tuple[int, int]]] = []
 
-        m = re.search(rf"{re.escape(lang)}\s*=\s*{{", block)
+        # acha "<lang> = {"
+        m = re.search(rf"\b{re.escape(lang)}\s*=\s*{{", block_inner)
         if not m:
             return results
 
-        start = m.end()
-        end = self._find_matching_brace(block, start - 1)
-        if end is None:
+        lang_open_rel = m.end() - 1  # posição do "{" relativo a block_inner
+        lang_open_abs = block_inner_start_abs + lang_open_rel
+        lang_close_abs = self._find_matching_brace(full_text, lang_open_abs)
+        if lang_close_abs is None:
             return results
 
-        lang_content = block[start:end]
+        # conteúdo dentro do { ... } do idioma
+        lang_inner_start_abs = lang_open_abs + 1
+        lang_inner_end_abs = lang_close_abs
+        lang_inner = full_text[lang_inner_start_abs:lang_inner_end_abs]
 
-        for sm in re.finditer(r'"([^"]+)"', lang_content):
-            s = sm.group(1)
-            span = sm.span()
-            # ajusta para posição absoluta no arquivo
-            abs_start = span[0] + (ctx := 0)
-            results.append((s, span))
+        # captura tokens "...." (match inteiro inclui aspas)
+        for sm in re.finditer(r"\"([^\"\\]*(?:\\.[^\"\\]*)*)\"", lang_inner):
+            token_rel_a, token_rel_b = sm.span(0)
+            token_abs_a = lang_inner_start_abs + token_rel_a
+            token_abs_b = lang_inner_start_abs + token_rel_b
+
+            # conteúdo sem aspas, com escapes resolvidos minimamente
+            raw_inside = sm.group(1)
+            original = self._unescape_lua_string(raw_inside)
+
+            results.append((original, (token_abs_a, token_abs_b)))
 
         return results
 
-    def _find_matching_brace(self, text: str, open_pos: int):
+    def _find_matching_brace(self, text: str, open_pos: int) -> int | None:
+        """
+        Retorna o índice ABSOLUTO do '}' que fecha a '{' em open_pos.
+        Tenta ignorar chaves dentro de strings "..."
+        """
         depth = 0
+        in_str = False
+        esc = False
+
         for i in range(open_pos, len(text)):
-            if text[i] == "{":
+            ch = text[i]
+
+            if in_str:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == "\"":
+                    in_str = False
+                continue
+
+            # fora de string
+            if ch == "\"":
+                in_str = True
+                continue
+
+            if ch == "{":
                 depth += 1
-            elif text[i] == "}":
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
                     return i
+
         return None
+
+    def _escape_lua_string(self, s: str) -> str:
+        # básico e suficiente para maioria dos scripts
+        return (
+            s.replace("\\", "\\\\")
+             .replace("\"", "\\\"")
+             .replace("\r", "\\r")
+             .replace("\n", "\\n")
+        )
+
+    def _unescape_lua_string(self, s: str) -> str:
+        # mínimo: desfaz \" \\ \n \r
+        s = s.replace("\\n", "\n").replace("\\r", "\r")
+        s = s.replace("\\\"", "\"").replace("\\\\", "\\")
+        return s
 
 
 plugin = ArtemisParser()
