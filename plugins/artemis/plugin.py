@@ -22,8 +22,12 @@ class ArtemisParser:
     # --------------------------------------------------
     def parse(self, ctx: ParseContext, text: str) -> list[dict]:
         project = ctx.project
-        src_lang = (project.get("source_language") or "ja").strip()
-        tgt_lang = (project.get("target_language") or "pt-BR").strip()
+
+        src_lang_raw = (project.get("source_language") or "ja").strip()
+        tgt_lang_raw = (project.get("target_language") or "pt-BR").strip()
+
+        src_lang = self._normalize_lang_key(src_lang_raw)
+        tgt_lang = self._normalize_lang_key(tgt_lang_raw)
 
         entries: list[dict] = []
 
@@ -34,44 +38,55 @@ class ArtemisParser:
             if block_close_abs is None:
                 continue
 
-            # conteúdo dentro do { ... } (sem as chaves externas)
             inner_start_abs = block_open_abs + 1
             inner_end_abs = block_close_abs
             block_inner = text[inner_start_abs:inner_end_abs]
 
-            # tenta pegar o idioma configurado; se não existir, cai pra ja
+            # tenta pegar o idioma configurado; se não existir, tenta fallbacks
             found = self._extract_lang_strings_abs(
                 full_text=text,
                 block_inner=block_inner,
                 block_inner_start_abs=inner_start_abs,
                 lang=src_lang,
             )
-            if not found and src_lang != "ja":
-                found = self._extract_lang_strings_abs(
-                    full_text=text,
-                    block_inner=block_inner,
-                    block_inner_start_abs=inner_start_abs,
-                    lang="ja",
-                )
+
+            if not found:
+                # fallbacks comuns (mantém compatibilidade com projetos antigos)
+                for fb in ("ja", "en", "cn"):
+                    if fb == src_lang:
+                        continue
+                    found = self._extract_lang_strings_abs(
+                        full_text=text,
+                        block_inner=block_inner,
+                        block_inner_start_abs=inner_start_abs,
+                        lang=fb,
+                    )
+                    if found:
+                        # se caiu em fallback, registra isso
+                        src_lang = fb
+                        break
 
             if not found:
                 continue
 
             for original_str, span_abs in found:
-                # span_abs cobre o token com aspas:  "...."
                 entry_id = f"{inner_start_abs}:{span_abs[0]}:{span_abs[1]}"
-                entries.append({
-                    "entry_id": entry_id,
-                    "original": original_str,
-                    "translation": "",
-                    "status": "untranslated",
-                    "is_translatable": True,
-                    "meta": {
-                        "span_abs": span_abs,  # (a,b) ABSOLUTO em ctx.original_text
-                        "src_lang": src_lang,
-                        "tgt_lang": tgt_lang,
+                entries.append(
+                    {
+                        "entry_id": entry_id,
+                        "original": original_str,
+                        "translation": "",
+                        "status": "untranslated",
+                        "is_translatable": True,
+                        "meta": {
+                            "span_abs": span_abs,  # (a,b) ABSOLUTO em ctx.original_text
+                            "src_lang": src_lang,
+                            "tgt_lang": tgt_lang,
+                            "src_lang_raw": src_lang_raw,
+                            "tgt_lang_raw": tgt_lang_raw,
+                        },
                     }
-                })
+                )
 
         return entries
 
@@ -112,6 +127,48 @@ class ArtemisParser:
     # --------------------------------------------------
     # Helpers
     # --------------------------------------------------
+    def _normalize_lang_key(self, lang: str) -> str:
+        """
+        Normaliza códigos de idioma do projeto para chaves usadas no AST.
+
+        Exemplos:
+        - "pt-BR" -> "pt" (se você usar "pt" no AST)
+        - "en-US" -> "en"
+        - "jp" -> "ja"
+        - "zh" / "zh-CN" / "zh-TW" -> "cn" (porque seus .ast usam "cn")
+        """
+        s = (lang or "").strip()
+        if not s:
+            return "ja"
+
+        s_lower = s.lower()
+
+        # chinese aliases (AST usa "cn")
+        if s_lower in ("zh", "zh-cn", "zh-hans", "zh-sg"):
+            return "cn"
+        if s_lower in ("zh-tw", "zh-hant", "zh-hk", "zh-mo"):
+            return "cn"
+
+        # japanese aliases
+        if s_lower in ("jp", "ja-jp"):
+            return "ja"
+
+        # english variants
+        if s_lower.startswith("en-"):
+            return "en"
+
+        # portuguese variants (se um dia você criar "pt" no AST)
+        if s_lower.startswith("pt-"):
+            return "pt"
+
+        # pega só o prefixo antes do hífen: "xx-YY" -> "xx"
+        if "-" in s_lower:
+            base = s_lower.split("-", 1)[0].strip()
+            if base:
+                return base
+
+        return s_lower
+
     def _extract_lang_strings_abs(
         self,
         *,
@@ -129,6 +186,8 @@ class ArtemisParser:
         """
         results: list[tuple[str, tuple[int, int]]] = []
 
+        lang = self._normalize_lang_key(lang)
+
         # acha "<lang> = {"
         m = re.search(rf"\b{re.escape(lang)}\s*=\s*{{", block_inner)
         if not m:
@@ -140,7 +199,6 @@ class ArtemisParser:
         if lang_close_abs is None:
             return results
 
-        # conteúdo dentro do { ... } do idioma
         lang_inner_start_abs = lang_open_abs + 1
         lang_inner_end_abs = lang_close_abs
         lang_inner = full_text[lang_inner_start_abs:lang_inner_end_abs]
@@ -151,7 +209,6 @@ class ArtemisParser:
             token_abs_a = lang_inner_start_abs + token_rel_a
             token_abs_b = lang_inner_start_abs + token_rel_b
 
-            # conteúdo sem aspas, com escapes resolvidos minimamente
             raw_inside = sm.group(1)
             original = self._unescape_lua_string(raw_inside)
 
@@ -182,7 +239,6 @@ class ArtemisParser:
                     in_str = False
                 continue
 
-            # fora de string
             if ch == "\"":
                 in_str = True
                 continue
@@ -197,16 +253,14 @@ class ArtemisParser:
         return None
 
     def _escape_lua_string(self, s: str) -> str:
-        # básico e suficiente para maioria dos scripts
         return (
             s.replace("\\", "\\\\")
-             .replace("\"", "\\\"")
-             .replace("\r", "\\r")
-             .replace("\n", "\\n")
+            .replace("\"", "\\\"")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
         )
 
     def _unescape_lua_string(self, s: str) -> str:
-        # mínimo: desfaz \" \\ \n \r
         s = s.replace("\\n", "\n").replace("\\r", "\r")
         s = s.replace("\\\"", "\"").replace("\\\\", "\\")
         return s
