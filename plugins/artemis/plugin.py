@@ -1,20 +1,10 @@
+# plugins/artemis/plugin.py
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from typing import Iterator, Tuple, Optional
+
 from parsers.base import ParseContext
-
-
-@dataclass(frozen=True)
-class _Token:
-    kind: str  # "dq" | "long"
-    span_abs: tuple[int, int]  # cobre o token inteiro no arquivo (inclui delimitadores)
-    text_for_editor: str       # o que vai para entry["original"]
-    # metadados para rebuild
-    long_eq: int = 0
-    long_wrapped_quotes: bool = False  # True se era [["..."]] (ou [=[ "..." ]=])
-    # para debug/diagnóstico
-    raw_inner: str = ""
 
 
 class ArtemisParser:
@@ -40,7 +30,7 @@ class ArtemisParser:
 
         entries: list[dict] = []
 
-        # Procura por blocos "text = { ... }"
+        # Procura por blocos "text = { ... }" no arquivo inteiro
         for m in re.finditer(r"\btext\s*=\s*{", text):
             block_open_abs = m.end() - 1  # posição do "{"
             block_close_abs = self._find_matching_brace(text, block_open_abs)
@@ -51,39 +41,41 @@ class ArtemisParser:
             inner_end_abs = block_close_abs
             block_inner = text[inner_start_abs:inner_end_abs]
 
-            tokens = self._extract_lang_tokens_abs(
+            found = self._extract_lang_strings_abs(
                 full_text=text,
                 block_inner=block_inner,
                 block_inner_start_abs=inner_start_abs,
                 lang=src_lang,
             )
 
-            # fallback para ja (se o idioma escolhido não existir)
-            if not tokens and src_lang != "ja":
-                tokens = self._extract_lang_tokens_abs(
+            # fallback: se idioma escolhido não existir, tenta "ja"
+            if not found and src_lang != "ja":
+                found = self._extract_lang_strings_abs(
                     full_text=text,
                     block_inner=block_inner,
                     block_inner_start_abs=inner_start_abs,
                     lang="ja",
                 )
 
-            if not tokens:
+            if not found:
                 continue
 
-            for t in tokens:
-                entry_id = f"{inner_start_abs}:{t.span_abs[0]}:{t.span_abs[1]}"
+            for token in found:
+                original_str = token["text_for_editor"]
+                span_abs = token["span_abs"]
+
+                entry_id = f"{inner_start_abs}:{span_abs[0]}:{span_abs[1]}"
                 entries.append(
                     {
                         "entry_id": entry_id,
-                        "original": t.text_for_editor,
+                        "original": original_str,
                         "translation": "",
                         "status": "untranslated",
                         "is_translatable": True,
                         "meta": {
-                            "span_abs": t.span_abs,  # (a,b) cobre token inteiro no arquivo
-                            "kind": t.kind,
-                            "long_eq": t.long_eq,
-                            "long_wrapped_quotes": t.long_wrapped_quotes,
+                            "span_abs": span_abs,              # (a,b) ABS no arquivo
+                            "token_kind": token["kind"],       # "quoted" | "long"
+                            "wrapped_quotes": token["wrapped_quotes"],  # bool (só para long)
                             "src_lang": src_lang,
                             "tgt_lang": tgt_lang,
                         },
@@ -105,98 +97,113 @@ class ArtemisParser:
                 return int(span[0])
             return -1
 
+        # substitui de trás pra frente para não invalidar offsets
         for e in sorted(entries, key=_key, reverse=True):
             tr = e.get("translation")
-            if not isinstance(tr, str) or not tr.strip():
+            if not isinstance(tr, str):
+                continue
+            tr = tr.strip()
+            if not tr:
                 continue
 
             meta = e.get("meta") or {}
             span = meta.get("span_abs")
             if not (isinstance(span, (list, tuple)) and len(span) == 2):
                 continue
-
             a, b = int(span[0]), int(span[1])
             if not (0 <= a < b <= len(out)):
                 continue
 
-            kind = (meta.get("kind") or "dq").strip()
-            tr_clean = tr.strip()
+            kind = (meta.get("token_kind") or "").strip()
 
-            if kind == "dq":
-                escaped = self._escape_lua_string(tr_clean)
-                repl = f"\"{escaped}\""
-            else:
-                # long bracket
-                wrapped = bool(meta.get("long_wrapped_quotes"))
+            if kind == "quoted":
+                escaped = self._escape_lua_string(tr)
+                replacement = f"\"{escaped}\""
+
+            elif kind == "long":
+                wrapped = bool(meta.get("wrapped_quotes"))
                 if wrapped:
-                    # preserva estilo [["..."]]
-                    eq = int(meta.get("long_eq") or 0)
-                    open_delim = "[" + ("=" * eq) + "["
-                    close_delim = "]" + ("=" * eq) + "]"
-                    inner = self._escape_lua_string(tr_clean)
-                    repl = f'{open_delim}"{inner}"{close_delim}'
+                    # preserva o estilo [[ "..." ]] (com aspas dentro)
+                    escaped = self._escape_lua_string(tr)
+                    inner = f"\"{escaped}\""
+                    open_, close = self._make_safe_long_brackets(inner)
+                    replacement = f"{open_}{inner}{close}"
                 else:
-                    # preserva [[...]] mas escolhe delimitador seguro se necessário
-                    open_delim, close_delim = self._make_safe_long_brackets(tr_clean)
-                    repl = f"{open_delim}{tr_clean}{close_delim}"
+                    # string literal em long-bracket sem escapes; só escolhe delimitador seguro
+                    inner = tr
+                    open_, close = self._make_safe_long_brackets(inner)
+                    replacement = f"{open_}{inner}{close}"
 
-            out = out[:a] + repl + out[b:]
+            else:
+                # fallback seguro: escreve como string quoted normal
+                escaped = self._escape_lua_string(tr)
+                replacement = f"\"{escaped}\""
+
+            out = out[:a] + replacement + out[b:]
 
         return out
 
     # --------------------------------------------------
-    # Helpers: extract tokens por idioma
+    # Extract helpers
     # --------------------------------------------------
-    def _extract_lang_tokens_abs(
+    def _extract_lang_strings_abs(
         self,
         *,
         full_text: str,
         block_inner: str,
         block_inner_start_abs: int,
         lang: str,
-    ) -> list[_Token]:
+    ) -> list[dict]:
         """
         Encontra o sub-bloco:
             <lang> = { ... }
-        e retorna os tokens (strings) dentro dele (quoted e long-bracket),
-        com spans ABSOLUTOS no arquivo inteiro.
+        e retorna tokens de string encontrados dentro dele.
+        Cada token:
+          {
+            "kind": "quoted"|"long",
+            "span_abs": (a,b)  # cobre o token inteiro incluindo delimitadores
+            "text_for_editor": str,   # texto "limpo" p/ editor
+            "wrapped_quotes": bool,   # só em long
+          }
         """
-        # acha "<lang> = {"
+        results: list[dict] = []
+
         m = re.search(rf"\b{re.escape(lang)}\s*=\s*{{", block_inner)
         if not m:
-            return []
+            return results
 
         lang_open_rel = m.end() - 1
         lang_open_abs = block_inner_start_abs + lang_open_rel
         lang_close_abs = self._find_matching_brace(full_text, lang_open_abs)
         if lang_close_abs is None:
-            return []
+            return results
 
         lang_inner_start_abs = lang_open_abs + 1
         lang_inner_end_abs = lang_close_abs
         lang_inner = full_text[lang_inner_start_abs:lang_inner_end_abs]
 
-        tokens: list[_Token] = []
-        for tok in self._iter_lua_string_tokens(lang_inner, base_abs=lang_inner_start_abs):
-            tokens.append(tok)
+        for tok in self._iter_lua_string_tokens(lang_inner, lang_inner_start_abs):
+            results.append(tok)
 
-        return tokens
+        return results
 
-    def _iter_lua_string_tokens(self, s: str, *, base_abs: int) -> list[_Token]:
+    def _iter_lua_string_tokens(self, s: str, base_abs: int) -> Iterator[dict]:
         """
-        Tokeniza strings Lua-like dentro de `s`:
-        - "...." com escapes
-        - [[....]] / [=[....]=] etc (qualquer nível)
-        Retorna spans ABSOLUTOS (base_abs + offsets).
+        Itera por tokens string no trecho:
+        - quoted: "...." com escapes
+        - long brackets: [[...]], [=[...]=], [==[...]==], etc.
+
+        Retorna dicts com spans ABS e versão para o editor.
         """
-        out: list[_Token] = []
         i = 0
         n = len(s)
 
         while i < n:
             ch = s[i]
 
-            # quoted "..."
+            # -----------------------
+            # Quoted: " ... "
+            # -----------------------
             if ch == '"':
                 start = i
                 i += 1
@@ -212,135 +219,128 @@ class ArtemisParser:
                         i += 1
                         continue
                     if c == '"':
-                        end = i + 1  # exclusivo
-                        raw_inside = s[start + 1 : i]
-                        text_for_editor = self._unescape_lua_string(raw_inside)
-                        out.append(
-                            _Token(
-                                kind="dq",
-                                span_abs=(base_abs + start, base_abs + end),
-                                text_for_editor=text_for_editor,
-                                raw_inner=raw_inside,
-                            )
-                        )
-                        i = end
+                        i += 1  # inclui aspas finais
+                        end = i
+                        inner = s[start + 1 : end - 1]
+                        text_for_editor = self._unescape_lua_string(inner)
+                        yield {
+                            "kind": "quoted",
+                            "span_abs": (base_abs + start, base_abs + end),
+                            "text_for_editor": text_for_editor,
+                            "wrapped_quotes": False,
+                        }
                         break
                     i += 1
                 else:
                     # string quebrada; aborta
-                    break
+                    return
                 continue
 
-            # long bracket: [=*[ ... ]=*]
+            # -----------------------
+            # Long bracket: [=*[ ... ]=*]
+            # -----------------------
             if ch == "[":
-                eq = 0
-                j = i + 1
-                while j < n and s[j] == "=":
-                    eq += 1
-                    j += 1
-                if j < n and s[j] == "[":
-                    open_len = 2 + eq  # "[" + "="*eq + "["
-                    close_delim = "]" + ("=" * eq) + "]"
-                    start = i
-                    content_start = i + open_len
+                lb = self._try_parse_long_bracket(s, i)
+                if lb is not None:
+                    start, end, raw_inner = lb
 
-                    k = content_start
-                    # procura close_delim
-                    pos = s.find(close_delim, k)
-                    if pos != -1:
-                        end = pos + len(close_delim)  # exclusivo
-                        raw_inner = s[content_start:pos]
+                    # Detecta caso [[ "..." ]] (com espaços/newlines ao redor)
+                    trim = raw_inner.strip()
+                    wrapped_quotes = False
+                    text_for_editor = raw_inner
 
-                        # caso [["..."]] => raw_inner começa/termina com aspas e é "simples"
-                        wrapped_quotes = False
-                        text_for_editor = raw_inner
-                        if len(raw_inner) >= 2 and raw_inner[0] == '"' and raw_inner[-1] == '"':
-                            # só remove se for “uma string quoted simples” (sem outras aspas)
-                            if raw_inner.count('"') == 2:
-                                wrapped_quotes = True
-                                inner_quoted = raw_inner[1:-1]
-                                text_for_editor = self._unescape_lua_string(inner_quoted)
+                    if len(trim) >= 2 and trim[0] == '"' and trim[-1] == '"':
+                        if trim.count('"') == 2:
+                            wrapped_quotes = True
+                            inner_quoted = trim[1:-1]
+                            text_for_editor = self._unescape_lua_string(inner_quoted)
 
-                        out.append(
-                            _Token(
-                                kind="long",
-                                span_abs=(base_abs + start, base_abs + end),
-                                text_for_editor=text_for_editor,
-                                long_eq=eq,
-                                long_wrapped_quotes=wrapped_quotes,
-                                raw_inner=raw_inner,
-                            )
-                        )
-                        i = end
-                        continue
+                    yield {
+                        "kind": "long",
+                        "span_abs": (base_abs + start, base_abs + end),
+                        "text_for_editor": text_for_editor,
+                        "wrapped_quotes": wrapped_quotes,
+                    }
+
+                    i = end
+                    continue
 
             i += 1
 
-        return out
+    def _try_parse_long_bracket(self, s: str, i: int) -> Optional[Tuple[int, int, str]]:
+        """
+        Se s[i:] começa com long-bracket opener, retorna:
+          (start_index, end_index, inner_string)
+        onde end_index é EXCLUSIVO.
+        """
+        n = len(s)
+        if i >= n or s[i] != "[":
+            return None
+
+        j = i + 1
+        eq = 0
+        while j < n and s[j] == "=":
+            eq += 1
+            j += 1
+        if j >= n or s[j] != "[":
+            return None
+
+        open_len = 2 + eq  # '[' + '='* + '['
+        open_end = i + open_len
+
+        close = "]" + ("=" * eq) + "]"
+
+        k = s.find(close, open_end)
+        if k == -1:
+            return None
+
+        inner = s[open_end:k]
+        end = k + len(close)
+        return (i, end, inner)
 
     # --------------------------------------------------
-    # Brace matching
+    # Brace matcher
     # --------------------------------------------------
     def _find_matching_brace(self, text: str, open_pos: int) -> int | None:
         """
         Retorna o índice ABSOLUTO do '}' que fecha a '{' em open_pos.
-        Ignora chaves dentro de strings "..." e long brackets.
+        Ignora chaves dentro de strings "..." e long-brackets [=[...]=].
         """
         depth = 0
+        in_q = False
+        esc = False
+
         i = open_pos
         n = len(text)
-
-        in_dq = False
-        dq_esc = False
-
-        # long bracket state
-        in_long = False
-        long_close = ""
 
         while i < n:
             ch = text[i]
 
-            # dentro de long bracket
-            if in_long:
-                if long_close and text.startswith(long_close, i):
-                    i += len(long_close)
-                    in_long = False
-                    long_close = ""
-                    continue
-                i += 1
-                continue
-
-            # dentro de double-quote
-            if in_dq:
-                if dq_esc:
-                    dq_esc = False
+            # dentro de string quoted
+            if in_q:
+                if esc:
+                    esc = False
                     i += 1
                     continue
                 if ch == "\\":
-                    dq_esc = True
+                    esc = True
                     i += 1
                     continue
                 if ch == '"':
-                    in_dq = False
+                    in_q = False
                 i += 1
                 continue
 
-            # fora de string: inicia long bracket?
+            # fora de quoted: tenta pular long-brackets inteiros
             if ch == "[":
-                eq = 0
-                j = i + 1
-                while j < n and text[j] == "=":
-                    eq += 1
-                    j += 1
-                if j < n and text[j] == "[":
-                    in_long = True
-                    long_close = "]" + ("=" * eq) + "]"
-                    i = j + 1
+                lb = self._try_parse_long_bracket(text, i)
+                if lb is not None:
+                    _, end, _inner = lb
+                    i = end
                     continue
 
-            # inicia double-quote?
             if ch == '"':
-                in_dq = True
+                in_q = True
                 i += 1
                 continue
 
@@ -356,22 +356,7 @@ class ArtemisParser:
         return None
 
     # --------------------------------------------------
-    # Long bracket safe builder
-    # --------------------------------------------------
-    def _make_safe_long_brackets(self, s: str) -> tuple[str, str]:
-        """
-        Escolhe [=*[ e ]=*] que não conflite com o conteúdo.
-        """
-        for eq in range(0, 8):
-            close = "]" + ("=" * eq) + "]"
-            if close not in s:
-                open_ = "[" + ("=" * eq) + "["
-                return open_, close
-        # fallback extremo: usa aspas
-        return '"', '"'
-
-    # --------------------------------------------------
-    # Escapes
+    # String escaping
     # --------------------------------------------------
     def _escape_lua_string(self, s: str) -> str:
         return (
@@ -385,6 +370,19 @@ class ArtemisParser:
         s = s.replace("\\n", "\n").replace("\\r", "\r")
         s = s.replace("\\\"", "\"").replace("\\\\", "\\")
         return s
+
+    def _make_safe_long_brackets(self, inner: str) -> tuple[str, str]:
+        """
+        Escolhe [=*[ ... ]=*] que NÃO conflite com o conteúdo.
+        Sem limite fixo.
+        """
+        eq = 0
+        while True:
+            close = "]" + ("=" * eq) + "]"
+            if close not in inner:
+                open_ = "[" + ("=" * eq) + "["
+                return open_, close
+            eq += 1
 
 
 plugin = ArtemisParser()
