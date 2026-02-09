@@ -21,24 +21,21 @@ class ArtemisParser:
     # Parse
     # --------------------------------------------------
     def parse(self, ctx: ParseContext, text: str) -> list[dict]:
-        project = ctx.project
-
-        src_lang_raw = (project.get("source_language") or "ja").strip()
-        tgt_lang_raw = (project.get("target_language") or "pt-BR").strip()
-
-        src_lang = self._normalize_lang_key(src_lang_raw)
-        tgt_lang = self._normalize_lang_key(tgt_lang_raw)
+        project = ctx.project or {}
+        src_lang = self._normalize_lang_key((project.get("source_language") or "ja").strip())
+        tgt_lang = (project.get("target_language") or "pt-BR").strip()
 
         entries: list[dict] = []
 
-        for m in re.finditer(r"\ warning:?\btext\s*=\s*{", text):
-            block_open_abs = m.end() - 1
-            block_close_abs = self._find_matching_brace(text, block_open_abs)
-            if block_close_abs is None:
+        # Procura por blocos "text = { ... }"
+        for m in re.finditer(r"\btext\s*=\s*{", text):
+            text_open_abs = m.end() - 1  # posição do "{"
+            text_close_abs = self._find_matching_brace(text, text_open_abs)
+            if text_close_abs is None:
                 continue
 
-            inner_start_abs = block_open_abs + 1
-            inner_end_abs = block_close_abs
+            inner_start_abs = text_open_abs + 1
+            inner_end_abs = text_close_abs
             block_inner = text[inner_start_abs:inner_end_abs]
 
             found = self._extract_lang_strings_abs(
@@ -48,19 +45,14 @@ class ArtemisParser:
                 lang=src_lang,
             )
 
-            if not found:
-                for fb in ("ja", "en", "cn"):
-                    if fb == src_lang:
-                        continue
-                    found = self._extract_lang_strings_abs(
-                        full_text=text,
-                        block_inner=block_inner,
-                        block_inner_start_abs=inner_start_abs,
-                        lang=fb,
-                    )
-                    if found:
-                        src_lang = fb
-                        break
+            # fallback simples
+            if not found and src_lang != "ja":
+                found = self._extract_lang_strings_abs(
+                    full_text=text,
+                    block_inner=block_inner,
+                    block_inner_start_abs=inner_start_abs,
+                    lang="ja",
+                )
 
             if not found:
                 continue
@@ -75,12 +67,10 @@ class ArtemisParser:
                         "status": "untranslated",
                         "is_translatable": True,
                         "meta": {
-                            "span_abs": span_abs,          # token inteiro
-                            "string_style": style,         # "quoted" | "bracket" | "bracket_quoted"
+                            "span_abs": span_abs,          # token inteiro (inclui delimitadores)
+                            "string_style": style,         # quoted | bracket | bracket_quoted
                             "src_lang": src_lang,
                             "tgt_lang": tgt_lang,
-                            "src_lang_raw": src_lang_raw,
-                            "tgt_lang_raw": tgt_lang_raw,
                         },
                     }
                 )
@@ -127,30 +117,17 @@ class ArtemisParser:
         s = (lang or "").strip().lower()
         if not s:
             return "ja"
-
-        if s in ("zh", "zh-cn", "zh-hans", "zh-sg", "zh-tw", "zh-hant", "zh-hk", "zh-mo"):
+        if s in ("zh", "zh-cn", "zh-hans", "zh-sg", "zh-tw", "zh-hant", "zh-hk"):
             return "cn"
         if s in ("jp", "ja-jp"):
             return "ja"
-        if s.startswith("en-"):
-            return "en"
-        if s.startswith("pt-"):
-            return "pt"
         if "-" in s:
-            base = s.split("-", 1)[0].strip()
-            if base:
-                return base
-        return s
+            s = s.split("-", 1)[0].strip()
+        return s or "ja"
 
     def _format_replacement(self, s: str, style: str) -> str:
-        """
-        Mantém o mesmo formato do token original:
-        - quoted: "..."
-        - bracket: [[...]]
-        - bracket_quoted: [["..."]]
-        """
         if style == "bracket":
-            # se contiver ']]', não dá para usar [[...]] com segurança
+            # [[...]] não suporta ']]' dentro
             if "]]" in s:
                 esc = self._escape_lua_string(s)
                 return f"\"{esc}\""
@@ -160,7 +137,6 @@ class ArtemisParser:
             esc = self._escape_lua_string(s)
             return f"[[\"{esc}\"]]"
 
-        # default: quoted
         esc = self._escape_lua_string(s)
         return f"\"{esc}\""
 
@@ -173,17 +149,15 @@ class ArtemisParser:
         lang: str,
     ) -> list[tuple[str, tuple[int, int], str]]:
         """
-        Retorna lista de:
-          (conteúdo, (span_abs_a, span_abs_b), style)
-
+        Retorna (texto, (a,b), style)
         style:
-          - "quoted"          => "..."
-          - "bracket"         => [[...]]
-          - "bracket_quoted"  => [["..."]]
+          - quoted: "..."
+          - bracket: [[...]]
+          - bracket_quoted: [["..."]]
         """
         results: list[tuple[str, tuple[int, int], str]] = []
-
         lang = self._normalize_lang_key(lang)
+
         m = re.search(rf"\b{re.escape(lang)}\s*=\s*{{", block_inner)
         if not m:
             return results
@@ -198,45 +172,79 @@ class ArtemisParser:
         lang_inner_end_abs = lang_close_abs
         lang_inner = full_text[lang_inner_start_abs:lang_inner_end_abs]
 
-        # 1) bracket_quoted: [["..."]]
-        # 2) bracket: [[...]]
-        # 3) quoted: "..."
-        token_re = re.compile(
-            r"""
-            (\[\[\s*\"((?:\\.|[^\"\\])*)\"\s*\]\])        # 1: [["..."]]
-            |
-            (\[\[(?:(?!\]\]).)*\]\])                      # 3: [[...]]  (não-guloso sem atravessar ]]
-            |
-            (\"([^\"\\]*(?:\\.[^\"\\]*)*)\")              # 4: "..."
-            """,
-            re.VERBOSE | re.DOTALL,
-        )
+        i = 0
+        n = len(lang_inner)
 
-        for sm in token_re.finditer(lang_inner):
-            tok0 = sm.group(0)
-            token_rel_a, token_rel_b = sm.span(0)
-            token_abs_a = lang_inner_start_abs + token_rel_a
-            token_abs_b = lang_inner_start_abs + token_rel_b
+        while i < n:
+            ch = lang_inner[i]
 
-            if sm.group(1) is not None:
-                # [["..."]]
-                raw_inside = sm.group(2) or ""
-                original = self._unescape_lua_string(raw_inside)
-                results.append((original, (token_abs_a, token_abs_b), "bracket_quoted"))
+            # [["..."]]
+            if i + 3 < n and lang_inner[i:i+2] == "[[" and lang_inner[i+2] == "\"":
+                start = i
+                # procura o final "\"]]"
+                j = i + 3
+                esc = False
+                while j < n:
+                    c = lang_inner[j]
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == "\"":
+                        # espera ]] depois
+                        if j + 3 < n and lang_inner[j:j+4] == "\"]]":
+                            end = j + 4
+                            raw_inside = lang_inner[i+3:j]
+                            original = self._unescape_lua_string(raw_inside)
+                            a = lang_inner_start_abs + start
+                            b = lang_inner_start_abs + end
+                            results.append((original, (a, b), "bracket_quoted"))
+                            i = end
+                            break
+                    j += 1
+                else:
+                    i += 1
                 continue
 
-            if tok0.startswith("[[") and tok0.endswith("]]") and (sm.group(4) is None):
-                # [[...]] (sem quotes)
-                inner = tok0[2:-2]
-                results.append((inner, (token_abs_a, token_abs_b), "bracket"))
+            # [[...]]
+            if i + 1 < n and lang_inner[i:i+2] == "[[":
+                start = i
+                end = lang_inner.find("]]", i + 2)
+                if end != -1:
+                    end2 = end + 2
+                    inner = lang_inner[i+2:end]
+                    a = lang_inner_start_abs + start
+                    b = lang_inner_start_abs + end2
+                    results.append((inner, (a, b), "bracket"))
+                    i = end2
+                    continue
+
+            # "..."
+            if ch == "\"":
+                start = i
+                j = i + 1
+                esc = False
+                while j < n:
+                    c = lang_inner[j]
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == "\"":
+                        end = j + 1
+                        raw_inside = lang_inner[i+1:j]
+                        original = self._unescape_lua_string(raw_inside)
+                        a = lang_inner_start_abs + start
+                        b = lang_inner_start_abs + end
+                        results.append((original, (a, b), "quoted"))
+                        i = end
+                        break
+                    j += 1
+                else:
+                    i += 1
                 continue
 
-            if sm.group(4) is not None:
-                # "..."
-                raw_inside = sm.group(5) or ""
-                original = self._unescape_lua_string(raw_inside)
-                results.append((original, (token_abs_a, token_abs_b), "quoted"))
-                continue
+            i += 1
 
         return results
 
