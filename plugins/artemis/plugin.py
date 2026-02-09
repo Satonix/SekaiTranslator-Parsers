@@ -31,9 +31,8 @@ class ArtemisParser:
 
         entries: list[dict] = []
 
-        # Procura por blocos "text = { ... }" dentro do arquivo inteiro
-        for m in re.finditer(r"\btext\s*=\s*{", text):
-            block_open_abs = m.end() - 1  # posição do "{"
+        for m in re.finditer(r"\ warning:?\btext\s*=\s*{", text):
+            block_open_abs = m.end() - 1
             block_close_abs = self._find_matching_brace(text, block_open_abs)
             if block_close_abs is None:
                 continue
@@ -42,7 +41,6 @@ class ArtemisParser:
             inner_end_abs = block_close_abs
             block_inner = text[inner_start_abs:inner_end_abs]
 
-            # tenta pegar o idioma configurado; se não existir, tenta fallbacks
             found = self._extract_lang_strings_abs(
                 full_text=text,
                 block_inner=block_inner,
@@ -51,7 +49,6 @@ class ArtemisParser:
             )
 
             if not found:
-                # fallbacks comuns (mantém compatibilidade com projetos antigos)
                 for fb in ("ja", "en", "cn"):
                     if fb == src_lang:
                         continue
@@ -62,14 +59,13 @@ class ArtemisParser:
                         lang=fb,
                     )
                     if found:
-                        # se caiu em fallback, registra isso
                         src_lang = fb
                         break
 
             if not found:
                 continue
 
-            for original_str, span_abs in found:
+            for original_str, span_abs, style in found:
                 entry_id = f"{inner_start_abs}:{span_abs[0]}:{span_abs[1]}"
                 entries.append(
                     {
@@ -79,7 +75,8 @@ class ArtemisParser:
                         "status": "untranslated",
                         "is_translatable": True,
                         "meta": {
-                            "span_abs": span_abs,  # (a,b) ABSOLUTO em ctx.original_text
+                            "span_abs": span_abs,          # token inteiro
+                            "string_style": style,         # "quoted" | "bracket" | "bracket_quoted"
                             "src_lang": src_lang,
                             "tgt_lang": tgt_lang,
                             "src_lang_raw": src_lang_raw,
@@ -96,10 +93,8 @@ class ArtemisParser:
     def rebuild(self, ctx: ParseContext, entries: list[dict]) -> str:
         out = ctx.original_text
 
-        # Substitui de trás pra frente para não invalidar offsets
         def _key(e: dict) -> int:
-            meta = e.get("meta") or {}
-            span = meta.get("span_abs")
+            span = (e.get("meta") or {}).get("span_abs")
             if isinstance(span, (list, tuple)) and len(span) == 2:
                 return int(span[0])
             return -1
@@ -111,6 +106,8 @@ class ArtemisParser:
 
             meta = e.get("meta") or {}
             span = meta.get("span_abs")
+            style = (meta.get("string_style") or "quoted").strip()
+
             if not (isinstance(span, (list, tuple)) and len(span) == 2):
                 continue
 
@@ -118,9 +115,8 @@ class ArtemisParser:
             if not (0 <= a < b <= len(out)):
                 continue
 
-            # span cobre o token COM aspas: "..."
-            escaped = self._escape_lua_string(tr.strip())
-            out = out[:a] + f"\"{escaped}\"" + out[b:]
+            replacement = self._format_replacement(tr.strip(), style)
+            out = out[:a] + replacement + out[b:]
 
         return out
 
@@ -128,46 +124,45 @@ class ArtemisParser:
     # Helpers
     # --------------------------------------------------
     def _normalize_lang_key(self, lang: str) -> str:
-        """
-        Normaliza códigos de idioma do projeto para chaves usadas no AST.
-
-        Exemplos:
-        - "pt-BR" -> "pt" (se você usar "pt" no AST)
-        - "en-US" -> "en"
-        - "jp" -> "ja"
-        - "zh" / "zh-CN" / "zh-TW" -> "cn" (porque seus .ast usam "cn")
-        """
-        s = (lang or "").strip()
+        s = (lang or "").strip().lower()
         if not s:
             return "ja"
 
-        s_lower = s.lower()
-
-        # chinese aliases (AST usa "cn")
-        if s_lower in ("zh", "zh-cn", "zh-hans", "zh-sg"):
+        if s in ("zh", "zh-cn", "zh-hans", "zh-sg", "zh-tw", "zh-hant", "zh-hk", "zh-mo"):
             return "cn"
-        if s_lower in ("zh-tw", "zh-hant", "zh-hk", "zh-mo"):
-            return "cn"
-
-        # japanese aliases
-        if s_lower in ("jp", "ja-jp"):
+        if s in ("jp", "ja-jp"):
             return "ja"
-
-        # english variants
-        if s_lower.startswith("en-"):
+        if s.startswith("en-"):
             return "en"
-
-        # portuguese variants (se um dia você criar "pt" no AST)
-        if s_lower.startswith("pt-"):
+        if s.startswith("pt-"):
             return "pt"
-
-        # pega só o prefixo antes do hífen: "xx-YY" -> "xx"
-        if "-" in s_lower:
-            base = s_lower.split("-", 1)[0].strip()
+        if "-" in s:
+            base = s.split("-", 1)[0].strip()
             if base:
                 return base
+        return s
 
-        return s_lower
+    def _format_replacement(self, s: str, style: str) -> str:
+        """
+        Mantém o mesmo formato do token original:
+        - quoted: "..."
+        - bracket: [[...]]
+        - bracket_quoted: [["..."]]
+        """
+        if style == "bracket":
+            # se contiver ']]', não dá para usar [[...]] com segurança
+            if "]]" in s:
+                esc = self._escape_lua_string(s)
+                return f"\"{esc}\""
+            return f"[[{s}]]"
+
+        if style == "bracket_quoted":
+            esc = self._escape_lua_string(s)
+            return f"[[\"{esc}\"]]"
+
+        # default: quoted
+        esc = self._escape_lua_string(s)
+        return f"\"{esc}\""
 
     def _extract_lang_strings_abs(
         self,
@@ -176,24 +171,24 @@ class ArtemisParser:
         block_inner: str,
         block_inner_start_abs: int,
         lang: str,
-    ) -> list[tuple[str, tuple[int, int]]]:
+    ) -> list[tuple[str, tuple[int, int], str]]:
         """
-        Encontra o sub-bloco:
-            <lang> = { ... }
-        e retorna lista de:
-            (conteúdo_da_string, (span_abs_inicio, span_abs_fim))
-        onde span_abs cobre o token com aspas no arquivo inteiro.
+        Retorna lista de:
+          (conteúdo, (span_abs_a, span_abs_b), style)
+
+        style:
+          - "quoted"          => "..."
+          - "bracket"         => [[...]]
+          - "bracket_quoted"  => [["..."]]
         """
-        results: list[tuple[str, tuple[int, int]]] = []
+        results: list[tuple[str, tuple[int, int], str]] = []
 
         lang = self._normalize_lang_key(lang)
-
-        # acha "<lang> = {"
         m = re.search(rf"\b{re.escape(lang)}\s*=\s*{{", block_inner)
         if not m:
             return results
 
-        lang_open_rel = m.end() - 1  # posição do "{" relativo a block_inner
+        lang_open_rel = m.end() - 1
         lang_open_abs = block_inner_start_abs + lang_open_rel
         lang_close_abs = self._find_matching_brace(full_text, lang_open_abs)
         if lang_close_abs is None:
@@ -203,24 +198,49 @@ class ArtemisParser:
         lang_inner_end_abs = lang_close_abs
         lang_inner = full_text[lang_inner_start_abs:lang_inner_end_abs]
 
-        # captura tokens "...." (match inteiro inclui aspas)
-        for sm in re.finditer(r"\"([^\"\\]*(?:\\.[^\"\\]*)*)\"", lang_inner):
+        # 1) bracket_quoted: [["..."]]
+        # 2) bracket: [[...]]
+        # 3) quoted: "..."
+        token_re = re.compile(
+            r"""
+            (\[\[\s*\"((?:\\.|[^\"\\])*)\"\s*\]\])        # 1: [["..."]]
+            |
+            (\[\[(?:(?!\]\]).)*\]\])                      # 3: [[...]]  (não-guloso sem atravessar ]]
+            |
+            (\"([^\"\\]*(?:\\.[^\"\\]*)*)\")              # 4: "..."
+            """,
+            re.VERBOSE | re.DOTALL,
+        )
+
+        for sm in token_re.finditer(lang_inner):
+            tok0 = sm.group(0)
             token_rel_a, token_rel_b = sm.span(0)
             token_abs_a = lang_inner_start_abs + token_rel_a
             token_abs_b = lang_inner_start_abs + token_rel_b
 
-            raw_inside = sm.group(1)
-            original = self._unescape_lua_string(raw_inside)
+            if sm.group(1) is not None:
+                # [["..."]]
+                raw_inside = sm.group(2) or ""
+                original = self._unescape_lua_string(raw_inside)
+                results.append((original, (token_abs_a, token_abs_b), "bracket_quoted"))
+                continue
 
-            results.append((original, (token_abs_a, token_abs_b)))
+            if tok0.startswith("[[") and tok0.endswith("]]") and (sm.group(4) is None):
+                # [[...]] (sem quotes)
+                inner = tok0[2:-2]
+                results.append((inner, (token_abs_a, token_abs_b), "bracket"))
+                continue
+
+            if sm.group(4) is not None:
+                # "..."
+                raw_inside = sm.group(5) or ""
+                original = self._unescape_lua_string(raw_inside)
+                results.append((original, (token_abs_a, token_abs_b), "quoted"))
+                continue
 
         return results
 
     def _find_matching_brace(self, text: str, open_pos: int) -> int | None:
-        """
-        Retorna o índice ABSOLUTO do '}' que fecha a '{' em open_pos.
-        Tenta ignorar chaves dentro de strings "..."
-        """
         depth = 0
         in_str = False
         esc = False
@@ -255,9 +275,9 @@ class ArtemisParser:
     def _escape_lua_string(self, s: str) -> str:
         return (
             s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\r", "\\r")
-            .replace("\n", "\\n")
+             .replace("\"", "\\\"")
+             .replace("\r", "\\r")
+             .replace("\n", "\\n")
         )
 
     def _unescape_lua_string(self, s: str) -> str:
