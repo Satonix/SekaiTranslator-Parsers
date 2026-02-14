@@ -7,6 +7,13 @@
       "name": "Artemis AST (.ast/.txt)",
       "min_ui_version": "0.7.0",
       "sha256": ""
+    },
+    {
+      "id": "diesel.nut",
+      "folder": "diesel",
+      "name": "Diesel NUT strings",
+      "min_ui_version": "0.1.0",
+      "sha256": ""
     }
   ]
 }
