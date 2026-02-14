@@ -1,16 +1,12 @@
-# Diesel Engine (NUT) Plugin
+Diesel engine - NUT strings parser
 
-Support for Diesel engine NUT string blocks.
+Folder: plugins/diesel
 
-## Features
+Implements the same interface as plugins/artemis/plugin.py:
+- plugin object with plugin_id, name, extensions
+- detect(ctx, text) -> float
+- parse(ctx, text) -> list[dict]
+- rebuild(ctx, entries) -> str
 
-- Detects string blocks with prefix 0x10 00 00 08
-- Reads format: [u32 size][string bytes]
-- Encoding: CP932 (Shift-JIS)
-- Updates header offsets at 0x08 and 0x0C
-
-## Notes
-
-- Offsets are recalculated during build()
-- Replacement is done in reverse order to prevent index shifting
-- Assumes only two header offsets require updating
+Binary handling:
+- Assumes loader provides text as latin1 1:1 bytes mapping.
