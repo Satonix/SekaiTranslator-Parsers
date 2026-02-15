@@ -1,8 +1,0 @@
-{
-    "encoding": "cp932",
-    "string_prefix": "10000008",
-    "header_offsets_to_update": [
-        8,
-        12
-    ]
-}
