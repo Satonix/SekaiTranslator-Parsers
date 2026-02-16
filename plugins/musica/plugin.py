@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-try:
-    from parsers.base import ParseContext
-except Exception:
-    from sekai_ui.parsers.base import ParseContext  # type: ignore
+from parsers.base import ParseContext
 
 
 MAP_ENCODE: Dict[str, str] = {
@@ -43,33 +40,29 @@ def _encode_table(s: str) -> str:
     return "".join(MAP_ENCODE.get(ch, ch) for ch in s)
 
 
-def _strip_dialog_quotes(s: str) -> str:
+def _strip_outer_quotes(s: str) -> str:
     if not s:
         return s
-    s = s.strip()
-    if len(s) >= 2:
+    t = s.strip()
+    if len(t) >= 2:
         pairs = {
             ('"', '"'),
             ("“", "”"),
             ("「", "」"),
             ("『", "』"),
-            ("(", ")"),
-            ("（", "）"),
-            ("<", ">"),
-            ("＜", "＞"),
         }
-        a, b = s[0], s[-1]
+        a, b = t[0], t[-1]
         if (a, b) in pairs:
-            return s[1:-1]
-    return s
+            return t[1:-1]
+    return t
 
 
-def _split_suffix(text: str) -> tuple[str, str]:
+def _split_suffix(text: str) -> Tuple[str, str]:
     m = re.search(r"(?s)^(.*?)(\\(?:v\\a|a|v))+(\s*)$", text)
     if not m:
         return text, ""
     body = m.group(1)
-    suf = text[len(body):]
+    suf = text[len(body) :]
     return body, suf
 
 
@@ -81,13 +74,31 @@ def _is_id_like(tok: str) -> bool:
     return any(ch.isdigit() for ch in tok)
 
 
-def _find_text_region(rest: str) -> tuple[str, str, str]:
+def _guess_speaker(rest: str) -> str:
+    s = rest.strip()
+    if not s:
+        return ""
+    toks = s.split()
+    if len(toks) < 2:
+        return ""
+    if not _is_id_like(toks[0]):
+        return ""
+    sp = toks[1].strip()
+    if sp.startswith("#"):
+        sp = sp[1:]
+    if sp.startswith("@"):
+        sp = sp[1:]
+    sp = sp.replace("@", "").strip()
+    return sp
+
+
+def _find_text_region(rest: str) -> Tuple[str, str, str]:
     rest = rest.rstrip("\r\n")
     lead_ws = rest[: len(rest) - len(rest.lstrip(" "))]
     rest_strip = rest.lstrip(" ")
 
     qpos: Optional[int] = None
-    for ch in ("“", '"', "「", "『", "（", "(", "＜", "<"):
+    for ch in ("“", '"', "「", "『"):
         i = rest_strip.find(ch)
         if i != -1 and (qpos is None or i < qpos):
             qpos = i
@@ -111,23 +122,7 @@ def _find_text_region(rest: str) -> tuple[str, str, str]:
     return lead_ws, body, suf
 
 
-def _guess_speaker(rest: str) -> str:
-    s = rest.strip()
-    if not s:
-        return ""
-    toks = s.split()
-    if len(toks) < 2:
-        return ""
-    if not _is_id_like(toks[0]):
-        return ""
-    sp = toks[1].strip()
-    if sp.startswith("#"):
-        sp = sp[1:]
-    sp = sp.replace("@", "").strip()
-    return sp
-
-
-class MusicaSCParser:
+class MusicaParser:
     plugin_id = "musica.sc"
     name = "Musica (.sc)"
     extensions = {".sc"}
@@ -141,13 +136,13 @@ class MusicaSCParser:
         fp = str(getattr(ctx, "file_path", "") or "")
         if fp.lower().endswith(".sc"):
             return 0.9
-        head = "\n".join(text.splitlines()[:60])
-        if ".message" in head:
+        head = "\n".join(text.splitlines()[:80])
+        if ".message" in head and ".stage" in head:
             return 0.55
         return 0.0
 
-    def parse(self, ctx: ParseContext, text: str) -> List[dict]:
-        entries: List[dict] = []
+    def parse(self, ctx: ParseContext, text: str) -> list[dict]:
+        entries: list[dict] = []
         lines = text.splitlines(keepends=True)
 
         for i, line in enumerate(lines):
@@ -159,11 +154,11 @@ class MusicaSCParser:
             if not m:
                 continue
 
-            ws, _, msgno, _, rest, nl = m.groups()
-            prefix, body, suf = _find_text_region(rest)
+            ws, sp1, msgno, sp2, rest, nl = m.groups()
+            prefix, body_raw, suf = _find_text_region(rest)
 
-            visible = _decode_table(body)
-            visible = _strip_dialog_quotes(visible)
+            visible = _decode_table(body_raw)
+            visible = _strip_outer_quotes(visible)
 
             if visible.strip() == "":
                 continue
@@ -173,15 +168,17 @@ class MusicaSCParser:
             entries.append(
                 {
                     "entry_id": f"{i}",
-                    "speaker": speaker,
                     "original": visible,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
+                    "speaker": speaker,
                     "meta": {
                         "line_index": i,
-                        "msgno": msgno,
                         "ws": ws,
+                        "sp1": sp1,
+                        "msgno": msgno,
+                        "sp2": sp2,
                         "prefix": prefix,
                         "suffix": suf,
                         "newline": nl or "",
@@ -191,21 +188,9 @@ class MusicaSCParser:
 
         return entries
 
-    def rebuild(self, ctx: ParseContext, entries: List[dict]) -> str:
-        p = getattr(ctx, "file_path", None) or getattr(ctx, "path", None)
-        if not p:
-            raise RuntimeError("ParseContext não tem file_path/path.")
-
-        enc = getattr(ctx, "encoding", None) or "utf-8"
-        with open(p, "rb") as f:
-            data = f.read()
-
-        try:
-            text = data.decode(enc, errors="strict")
-        except Exception:
-            text = data.decode(enc, errors="replace")
-
-        lines = text.splitlines(keepends=True)
+    def rebuild(self, ctx: ParseContext, entries: list[dict]) -> str:
+        out = ctx.original_text
+        lines = out.splitlines(keepends=True)
 
         by_line: Dict[int, dict] = {}
         for e in entries:
@@ -222,23 +207,25 @@ class MusicaSCParser:
                 by_line[li] = e
 
         for li, e in by_line.items():
-            meta = e.get("meta") or {}
-            m = _RX_MESSAGE.match(lines[li])
+            line = lines[li]
+            m = _RX_MESSAGE.match(line)
             if not m:
                 continue
 
             ws, sp1, msgno, sp2, _, nl = m.groups()
+
+            meta = e.get("meta") or {}
             prefix = str(meta.get("prefix") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
 
             tr = e.get("translation")
-            if isinstance(tr, str) and tr.strip() != "":
+            if isinstance(tr, str) and tr.strip():
                 body = tr.strip()
             else:
                 body = str(e.get("original") or "").strip()
 
-            body = _strip_dialog_quotes(body)
+            body = _strip_outer_quotes(body)
             body = _encode_table(body)
 
             lines[li] = f"{ws}.message{sp1}{msgno}{sp2}{prefix}{body}{suf}{newline}"
@@ -246,4 +233,4 @@ class MusicaSCParser:
         return "".join(lines)
 
 
-plugin = MusicaSCParser()
+plugin = MusicaParser()
