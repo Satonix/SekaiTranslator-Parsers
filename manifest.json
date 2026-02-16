@@ -11,7 +11,14 @@
     {
       "id": "diesel.nut",
       "folder": "diesel",
-      "name": "Diesel NUT strings",
+      "name": "Diesel NUT",
+      "min_ui_version": "0.1.0",
+      "sha256": ""
+    },
+    {
+      "id": "musica.sc",
+      "folder": "musica",
+      "name": "Musica SC",
       "min_ui_version": "0.1.0",
       "sha256": ""
     }
