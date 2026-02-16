@@ -68,15 +68,23 @@ def _guess_speaker(rest: str) -> str:
     s = rest.strip()
     if not s:
         return ""
+
     toks = s.split()
     if len(toks) < 2:
         return ""
+
     if not _is_id_like(toks[0]):
         return ""
+
     sp = toks[1]
+
     if sp.startswith("#"):
         sp = sp[1:]
+
+    sp = sp.rstrip("@")
+
     return sp.strip()
+
 
 
 def _strip_dialog_quotes(text: str) -> tuple[str, tuple[str, str]]:
@@ -227,3 +235,4 @@ class _MusicaSCPlugin:
 
 def get_plugin():
     return _MusicaSCPlugin()
+
