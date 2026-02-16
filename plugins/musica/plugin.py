@@ -3,50 +3,71 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
-from parsers.base import ParseContext
+try:
+    from parsers.base import ParseContext
+except Exception:
+    from sekai_ui.parsers.base import ParseContext  # type: ignore
 
 
-CHAR_MAP_DECODE = {
-    "ﾁ": "Á",
-    "ﾉ": "É",
-    "ﾍ": "Í",
-    "ﾓ": "Ó",
-    "ﾚ": "Ú",
-    "$": "á",
-    "^": "ã",
-    "<": "à",
-    ">": "â",
-    "&": "ç",
-    "%": "é",
-    "(": "ú",
-    ")": "ó",
-    "*": "õ",
+plugin_id = "musica.sc"
+name = "Musica (.sc)"
+extensions = {".sc"}
+
+
+MAP_ENCODE: Dict[str, str] = {
+    "Á": "ﾁ",
+    "É": "ﾉ",
+    "Í": "ﾍ",
+    "Ó": "ﾓ",
+    "Ú": "ﾚ",
+    "á": "$",
+    "ã": "^",
+    "à": "<",
+    "â": ">",
+    "ç": "&",
+    "é": "%",
+    "ú": "(",
+    "ó": ")",
+    "õ": "*",
 }
 
-CHAR_MAP_ENCODE = {v: k for k, v in CHAR_MAP_DECODE.items()}
-
-
-def decode_text(s: str) -> str:
-    if not s:
-        return s
-    for src, dst in CHAR_MAP_DECODE.items():
-        s = s.replace(src, dst)
-    return s
-
-
-def encode_text(s: str) -> str:
-    if not s:
-        return s
-    for src, dst in CHAR_MAP_ENCODE.items():
-        s = s.replace(src, dst)
-    return s
+MAP_DECODE: Dict[str, str] = {v: k for k, v in MAP_ENCODE.items()}
 
 
 _RX_MESSAGE = re.compile(r"^(\s*)\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$")
 
 
-_OPEN_QUOTES = {'"', "“", "「", "『"}
-_CLOSE_QUOTES = {'"', "”", "」", "』"}
+def _decode_table(s: str) -> str:
+    if not s:
+        return s
+    return "".join(MAP_DECODE.get(ch, ch) for ch in s)
+
+
+def _encode_table(s: str) -> str:
+    if not s:
+        return s
+    return "".join(MAP_ENCODE.get(ch, ch) for ch in s)
+
+
+def _strip_dialog_quotes(s: str) -> str:
+    if not s:
+        return s
+    s = s.strip()
+    if len(s) >= 2:
+        pairs = {
+            ('"', '"'),
+            ("“", "”"),
+            ("「", "」"),
+            ("『", "』"),
+            ("(", ")"),
+            ("（", "）"),
+            ("<", ">"),
+            ("＜", "＞"),
+        }
+        a, b = s[0], s[-1]
+        if (a, b) in pairs:
+            return s[1:-1]
+    return s
 
 
 def _split_suffix(text: str) -> tuple[str, str]:
@@ -54,7 +75,7 @@ def _split_suffix(text: str) -> tuple[str, str]:
     if not m:
         return text, ""
     body = m.group(1)
-    suf = text[len(body) :]
+    suf = text[len(body):]
     return body, suf
 
 
@@ -71,7 +92,7 @@ def _find_text_region(rest: str) -> tuple[str, str, str]:
     lead_ws = rest[: len(rest) - len(rest.lstrip(" "))]
     rest_strip = rest.lstrip(" ")
 
-    qpos = None
+    qpos: Optional[int] = None
     for ch in ("“", '"', "「", "『", "（", "(", "＜", "<"):
         i = rest_strip.find(ch)
         if i != -1 and (qpos is None or i < qpos):
@@ -105,34 +126,28 @@ def _guess_speaker(rest: str) -> str:
         return ""
     if not _is_id_like(toks[0]):
         return ""
-    sp = toks[1].lstrip("#@").strip()
+    sp = toks[1].strip()
+    if sp.startswith("#"):
+        sp = sp[1:]
+    sp = sp.replace("@", "").strip()
     return sp
 
 
-def _strip_dialog_quotes(text: str) -> tuple[str, str, str]:
-    if not text:
-        return "", "", ""
-    t = text.strip()
-    if len(t) >= 2 and t[0] in _OPEN_QUOTES and t[-1] in _CLOSE_QUOTES:
-        return t[0], t[1:-1], t[-1]
-    if len(t) >= 1 and t[0] in _OPEN_QUOTES:
-        return t[0], t[1:], ""
-    return "", t, ""
-
-
-class MusicaScPlugin:
-    plugin_id = "musica.sc"
-    name = "Musica (.sc)"
-    extensions = {".sc"}
-
+class MusicaSCParser:
     def detect(self, ctx: ParseContext, text: str) -> float:
-        ext = ctx.path.suffix.lower()
-        if ext != ".sc":
-            return 0.0
-        head = "\n".join(text.splitlines()[:80])
+        ext = getattr(ctx, "path", None)
+        if ext is not None:
+            try:
+                if ctx.path.suffix.lower() == ".sc":
+                    return 0.85
+            except Exception:
+                pass
+        if str(getattr(ctx, "file_path", "")).lower().endswith(".sc"):
+            return 0.85
+        head = "\n".join(text.splitlines()[:60])
         if ".message" in head:
-            return 0.9
-        return 0.6
+            return 0.55
+        return 0.0
 
     def parse(self, ctx: ParseContext, text: str) -> List[dict]:
         entries: List[dict] = []
@@ -150,10 +165,10 @@ class MusicaScPlugin:
             ws, _, msgno, _, rest, nl = m.groups()
             prefix, body, suf = _find_text_region(rest)
 
-            qopen, inner, qclose = _strip_dialog_quotes(body)
-            inner = decode_text(inner)
+            visible = _decode_table(body)
+            visible = _strip_dialog_quotes(visible)
 
-            if inner.strip() == "":
+            if visible.strip() == "":
                 continue
 
             speaker = _guess_speaker(rest)
@@ -162,7 +177,7 @@ class MusicaScPlugin:
                 {
                     "entry_id": f"{i}",
                     "speaker": speaker,
-                    "original": inner,
+                    "original": visible,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
@@ -171,8 +186,6 @@ class MusicaScPlugin:
                         "msgno": msgno,
                         "ws": ws,
                         "prefix": prefix,
-                        "qopen": qopen,
-                        "qclose": qclose,
                         "suffix": suf,
                         "newline": nl or "",
                     },
@@ -182,9 +195,14 @@ class MusicaScPlugin:
         return entries
 
     def rebuild(self, ctx: ParseContext, entries: List[dict]) -> str:
+        p = getattr(ctx, "file_path", None) or getattr(ctx, "path", None)
+        if not p:
+            raise RuntimeError("ParseContext não tem file_path/path.")
+
         enc = getattr(ctx, "encoding", None) or "utf-8"
-        with open(ctx.path, "rb") as f:
+        with open(p, "rb") as f:
             data = f.read()
+
         try:
             text = data.decode(enc, errors="strict")
         except Exception:
@@ -195,16 +213,16 @@ class MusicaScPlugin:
         by_line: Dict[int, dict] = {}
         for e in entries:
             meta = e.get("meta") or {}
-            li = meta.get("line_index")
-            if isinstance(li, int) and 0 <= li < len(lines):
-                by_line[li] = e
-                continue
+            li = None
             try:
-                li2 = int(str(e.get("entry_id", "")).strip())
+                li = int(meta.get("line_index"))
             except Exception:
-                continue
-            if 0 <= li2 < len(lines):
-                by_line[li2] = e
+                try:
+                    li = int(str(e.get("entry_id", "")).strip())
+                except Exception:
+                    li = None
+            if li is not None and 0 <= li < len(lines):
+                by_line[li] = e
 
         for li, e in by_line.items():
             meta = e.get("meta") or {}
@@ -214,24 +232,21 @@ class MusicaScPlugin:
 
             ws, sp1, msgno, sp2, rest, nl = m.groups()
             prefix = str(meta.get("prefix") or "")
-            qopen = str(meta.get("qopen") or "")
-            qclose = str(meta.get("qclose") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
 
             tr = e.get("translation")
-            if isinstance(tr, str) and tr != "":
-                inner = tr
+            if isinstance(tr, str) and tr.strip() != "":
+                body = tr.strip()
             else:
-                inner = e.get("original") or ""
+                body = str(e.get("original") or "").strip()
 
-            inner = encode_text(inner)
-            body = f"{qopen}{inner}{qclose}"
+            body = _strip_dialog_quotes(body)
+            body = _encode_table(body)
 
             lines[li] = f"{ws}.message{sp1}{msgno}{sp2}{prefix}{body}{suf}{newline}"
 
         return "".join(lines)
 
 
-def get_plugin():
-    return MusicaScPlugin()
+plugin = MusicaSCParser()
