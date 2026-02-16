@@ -3,7 +3,15 @@ from __future__ import annotations
 import re
 from typing import Dict, List
 
-from parsers.base import ParseContext
+try:
+    from parsers.base import ParseContext
+except Exception:
+    from sekai_ui.parsers.base import ParseContext  # type: ignore
+
+
+plugin_id = "musica.sc"
+name = "Musica (.sc)"
+extensions = {".sc"}
 
 
 _RX_MESSAGE = re.compile(r"^(\s*)\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$")
@@ -71,21 +79,29 @@ def _guess_speaker(rest: str) -> str:
     return sp.strip()
 
 
-class MusicaScPlugin:
-    plugin_id = "musica.sc"
-    name = "Musica (.sc)"
-    extensions = {".sc"}
+def _strip_dialog_quotes(text: str) -> tuple[str, tuple[str, str]]:
+    t = text.strip()
 
+    pairs = [
+        ("“", "”"),
+        ('"', '"'),
+        ("「", "」"),
+        ("『", "』"),
+    ]
+
+    for left, right in pairs:
+        if t.startswith(left) and t.endswith(right) and len(t) >= 2:
+            inner = t[len(left):-len(right)]
+            return inner, (left, right)
+
+    return text, ("", "")
+
+
+class MusicaSCParser:
     def detect(self, ctx: ParseContext, text: str) -> float:
-        try:
-            ext = ctx.path.suffix.lower()
-        except Exception:
-            ext = ""
-        if ext == ".sc":
-            return 0.95
-        head = "\n".join((text or "").splitlines()[:60]).lower()
-        if ".message" in head:
-            return 0.25
+        ext = getattr(getattr(ctx, "path", None), "suffix", "")
+        if isinstance(ext, str) and ext.lower() == ".sc":
+            return 0.9
         return 0.0
 
     def parse(self, ctx: ParseContext, text: str) -> List[dict]:
@@ -101,10 +117,10 @@ class MusicaScPlugin:
             if not m:
                 continue
 
-            ws, sp1, msgno, sp2, rest, nl = m.groups()
+            ws, _, msgno, _, rest, nl = m.groups()
             prefix, body, suf = _find_text_region(rest)
-            visible = body
 
+            visible, quote_pair = _strip_dialog_quotes(body)
             if visible.strip() == "":
                 continue
 
@@ -122,24 +138,20 @@ class MusicaScPlugin:
                         "line_index": i,
                         "msgno": msgno,
                         "ws": ws,
-                        "sp1": sp1,
-                        "sp2": sp2,
                         "prefix": prefix,
                         "suffix": suf,
                         "newline": nl or "",
+                        "quote_left": quote_pair[0],
+                        "quote_right": quote_pair[1],
                     },
                 }
             )
 
         return entries
 
-    def rebuild(self, ctx: ParseContext, entries: List[dict]) -> str:
-        p = getattr(ctx, "path", None) or getattr(ctx, "file_path", None)
-        if not p:
-            raise RuntimeError("ParseContext não tem path/file_path.")
-
+    def rebuild(self, ctx: ParseContext, entries: List[dict]) -> bytes:
+        data = self._read_bytes(ctx)
         enc = getattr(ctx, "encoding", None) or "utf-8"
-        data = p.read_bytes() if hasattr(p, "read_bytes") else open(p, "rb").read()
         try:
             text = data.decode(enc, errors="strict")
         except Exception:
@@ -166,18 +178,52 @@ class MusicaScPlugin:
             if not m:
                 continue
 
-            ws, sp1, msgno, sp2, _rest, nl = m.groups()
+            ws, sp1, msgno, sp2, rest, nl = m.groups()
             prefix = str(meta.get("prefix") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
 
             tr = e.get("translation")
-            body = tr if isinstance(tr, str) and tr != "" else (e.get("original") or "")
+            if isinstance(tr, str) and tr != "":
+                body = tr
+            else:
+                body = e.get("original") or ""
+
+            ql = meta.get("quote_left") or ""
+            qr = meta.get("quote_right") or ""
+            if ql and qr:
+                body = f"{ql}{body}{qr}"
 
             lines[li] = f"{ws}.message{sp1}{msgno}{sp2}{prefix}{body}{suf}{newline}"
 
-        return "".join(lines)
+        out_text = "".join(lines)
+        return out_text.encode(enc, errors="replace")
+
+    def _read_bytes(self, ctx: ParseContext) -> bytes:
+        p = getattr(ctx, "file_path", None) or getattr(ctx, "path", None)
+        if not p:
+            raise RuntimeError("ParseContext não tem file_path/path.")
+        with open(p, "rb") as f:
+            return f.read()
+
+
+class _MusicaSCPlugin:
+    plugin_id = "musica.sc"
+    name = "Musica (.sc)"
+    extensions = {".sc"}
+
+    def __init__(self) -> None:
+        self._impl = MusicaSCParser()
+
+    def detect(self, ctx: ParseContext, text: str) -> float:
+        return self._impl.detect(ctx, text)
+
+    def parse(self, ctx: ParseContext, text: str) -> list[dict]:
+        return self._impl.parse(ctx, text)
+
+    def rebuild(self, ctx: ParseContext, entries: list[dict]) -> bytes:
+        return self._impl.rebuild(ctx, entries)
 
 
 def get_plugin():
-    return MusicaScPlugin()
+    return _MusicaSCPlugin()
