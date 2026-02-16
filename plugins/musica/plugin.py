@@ -71,10 +71,22 @@ def _guess_speaker(rest: str) -> str:
     return sp.strip()
 
 
-class MusicaSCPlugin:
+class MusicaScPlugin:
     plugin_id = "musica.sc"
     name = "Musica (.sc)"
     extensions = {".sc"}
+
+    def detect(self, ctx: ParseContext, text: str) -> float:
+        try:
+            ext = ctx.path.suffix.lower()
+        except Exception:
+            ext = ""
+        if ext == ".sc":
+            return 0.95
+        head = "\n".join((text or "").splitlines()[:60]).lower()
+        if ".message" in head:
+            return 0.25
+        return 0.0
 
     def parse(self, ctx: ParseContext, text: str) -> List[dict]:
         entries: List[dict] = []
@@ -91,8 +103,9 @@ class MusicaSCPlugin:
 
             ws, sp1, msgno, sp2, rest, nl = m.groups()
             prefix, body, suf = _find_text_region(rest)
+            visible = body
 
-            if body.strip() == "":
+            if visible.strip() == "":
                 continue
 
             speaker = _guess_speaker(rest)
@@ -101,7 +114,7 @@ class MusicaSCPlugin:
                 {
                     "entry_id": f"{i}",
                     "speaker": speaker,
-                    "original": body,
+                    "original": visible,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
@@ -121,20 +134,16 @@ class MusicaSCPlugin:
         return entries
 
     def rebuild(self, ctx: ParseContext, entries: List[dict]) -> str:
-        base_text = getattr(ctx, "original_text", None)
-        if isinstance(base_text, str) and base_text:
-            text = base_text
-        else:
-            p = getattr(ctx, "file_path", None) or getattr(ctx, "path", None)
-            if not p:
-                raise RuntimeError("ParseContext não tem file_path/path/original_text.")
-            enc = getattr(ctx, "encoding", None) or "utf-8"
-            with open(p, "rb") as f:
-                data = f.read()
-            try:
-                text = data.decode(enc, errors="strict")
-            except Exception:
-                text = data.decode(enc, errors="replace")
+        p = getattr(ctx, "path", None) or getattr(ctx, "file_path", None)
+        if not p:
+            raise RuntimeError("ParseContext não tem path/file_path.")
+
+        enc = getattr(ctx, "encoding", None) or "utf-8"
+        data = p.read_bytes() if hasattr(p, "read_bytes") else open(p, "rb").read()
+        try:
+            text = data.decode(enc, errors="strict")
+        except Exception:
+            text = data.decode(enc, errors="replace")
 
         lines = text.splitlines(keepends=True)
 
@@ -152,22 +161,18 @@ class MusicaSCPlugin:
                 by_line[li] = e
 
         for li, e in by_line.items():
+            meta = e.get("meta") or {}
             m = _RX_MESSAGE.match(lines[li])
             if not m:
                 continue
 
-            ws, sp1, msgno, sp2, rest, nl = m.groups()
-            meta = e.get("meta") or {}
-
+            ws, sp1, msgno, sp2, _rest, nl = m.groups()
             prefix = str(meta.get("prefix") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
 
             tr = e.get("translation")
-            if isinstance(tr, str) and tr != "":
-                body = tr
-            else:
-                body = e.get("original") or ""
+            body = tr if isinstance(tr, str) and tr != "" else (e.get("original") or "")
 
             lines[li] = f"{ws}.message{sp1}{msgno}{sp2}{prefix}{body}{suf}{newline}"
 
@@ -175,4 +180,4 @@ class MusicaSCPlugin:
 
 
 def get_plugin():
-    return MusicaSCPlugin()
+    return MusicaScPlugin()
