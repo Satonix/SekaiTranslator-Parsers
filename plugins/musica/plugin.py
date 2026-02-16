@@ -1,17 +1,9 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
-try:
-    from parsers.base import ParseContext
-except Exception:
-    from sekai_ui.parsers.base import ParseContext  # type: ignore
-
-
-plugin_id = "musica.sc"
-name = "Musica (.sc)"
-extensions = {".sc"}
+from parsers.base import ParseContext
 
 
 _RX_MESSAGE = re.compile(r"^(\s*)\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$")
@@ -79,7 +71,11 @@ def _guess_speaker(rest: str) -> str:
     return sp.strip()
 
 
-class MusicaSCParser:
+class MusicaSCPlugin:
+    plugin_id = "musica.sc"
+    name = "Musica (.sc)"
+    extensions = {".sc"}
+
     def parse(self, ctx: ParseContext, text: str) -> List[dict]:
         entries: List[dict] = []
         lines = text.splitlines(keepends=True)
@@ -93,11 +89,10 @@ class MusicaSCParser:
             if not m:
                 continue
 
-            ws, _, msgno, _, rest, nl = m.groups()
+            ws, sp1, msgno, sp2, rest, nl = m.groups()
             prefix, body, suf = _find_text_region(rest)
-            visible = body
 
-            if visible.strip() == "":
+            if body.strip() == "":
                 continue
 
             speaker = _guess_speaker(rest)
@@ -106,7 +101,7 @@ class MusicaSCParser:
                 {
                     "entry_id": f"{i}",
                     "speaker": speaker,
-                    "original": visible,
+                    "original": body,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
@@ -114,6 +109,8 @@ class MusicaSCParser:
                         "line_index": i,
                         "msgno": msgno,
                         "ws": ws,
+                        "sp1": sp1,
+                        "sp2": sp2,
                         "prefix": prefix,
                         "suffix": suf,
                         "newline": nl or "",
@@ -123,13 +120,21 @@ class MusicaSCParser:
 
         return entries
 
-    def rebuild(self, ctx: ParseContext, entries: List[dict]) -> bytes:
-        data = self._read_bytes(ctx)
-        enc = getattr(ctx, "encoding", None) or "utf-8"
-        try:
-            text = data.decode(enc, errors="strict")
-        except Exception:
-            text = data.decode(enc, errors="replace")
+    def rebuild(self, ctx: ParseContext, entries: List[dict]) -> str:
+        base_text = getattr(ctx, "original_text", None)
+        if isinstance(base_text, str) and base_text:
+            text = base_text
+        else:
+            p = getattr(ctx, "file_path", None) or getattr(ctx, "path", None)
+            if not p:
+                raise RuntimeError("ParseContext não tem file_path/path/original_text.")
+            enc = getattr(ctx, "encoding", None) or "utf-8"
+            with open(p, "rb") as f:
+                data = f.read()
+            try:
+                text = data.decode(enc, errors="strict")
+            except Exception:
+                text = data.decode(enc, errors="replace")
 
         lines = text.splitlines(keepends=True)
 
@@ -147,12 +152,13 @@ class MusicaSCParser:
                 by_line[li] = e
 
         for li, e in by_line.items():
-            meta = e.get("meta") or {}
             m = _RX_MESSAGE.match(lines[li])
             if not m:
                 continue
 
             ws, sp1, msgno, sp2, rest, nl = m.groups()
+            meta = e.get("meta") or {}
+
             prefix = str(meta.get("prefix") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
@@ -165,15 +171,8 @@ class MusicaSCParser:
 
             lines[li] = f"{ws}.message{sp1}{msgno}{sp2}{prefix}{body}{suf}{newline}"
 
-        out_text = "".join(lines)
-        return out_text.encode(enc, errors="replace")
-
-    def _read_bytes(self, ctx: ParseContext) -> bytes:
-        p = getattr(ctx, "file_path", None) or getattr(ctx, "path", None)
-        if not p:
-            raise RuntimeError("ParseContext não tem file_path/path.")
-        with open(p, "rb") as f:
-            return f.read()
+        return "".join(lines)
 
 
-plugin = MusicaSCParser()
+def get_plugin():
+    return MusicaSCPlugin()
