@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 try:
     from parsers.base import ParseContext
 except Exception:
     from sekai_ui.parsers.base import ParseContext  # type: ignore
-
-
-plugin_id = "musica.sc"
-name = "Musica (.sc)"
-extensions = {".sc"}
 
 
 MAP_ENCODE: Dict[str, str] = {
@@ -32,7 +27,6 @@ MAP_ENCODE: Dict[str, str] = {
 }
 
 MAP_DECODE: Dict[str, str] = {v: k for k, v in MAP_ENCODE.items()}
-
 
 _RX_MESSAGE = re.compile(r"^(\s*)\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$")
 
@@ -134,16 +128,19 @@ def _guess_speaker(rest: str) -> str:
 
 
 class MusicaSCParser:
+    plugin_id = "musica.sc"
+    name = "Musica (.sc)"
+    extensions = {".sc"}
+
     def detect(self, ctx: ParseContext, text: str) -> float:
-        ext = getattr(ctx, "path", None)
-        if ext is not None:
-            try:
-                if ctx.path.suffix.lower() == ".sc":
-                    return 0.85
-            except Exception:
-                pass
-        if str(getattr(ctx, "file_path", "")).lower().endswith(".sc"):
-            return 0.85
+        try:
+            if getattr(ctx, "path", None) is not None and ctx.path.suffix.lower() == ".sc":
+                return 0.9
+        except Exception:
+            pass
+        fp = str(getattr(ctx, "file_path", "") or "")
+        if fp.lower().endswith(".sc"):
+            return 0.9
         head = "\n".join(text.splitlines()[:60])
         if ".message" in head:
             return 0.55
@@ -230,7 +227,7 @@ class MusicaSCParser:
             if not m:
                 continue
 
-            ws, sp1, msgno, sp2, rest, nl = m.groups()
+            ws, sp1, msgno, sp2, _, nl = m.groups()
             prefix = str(meta.get("prefix") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
