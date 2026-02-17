@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 from parsers.base import ParseContext
 
@@ -22,7 +22,6 @@ MAP_ENCODE: Dict[str, str] = {
     "ó": ")",
     "õ": "*",
 }
-
 MAP_DECODE: Dict[str, str] = {v: k for k, v in MAP_ENCODE.items()}
 
 # Supports optional channel prefix like "[e]." / "[j]." before ".message"
@@ -68,10 +67,7 @@ def _split_suffix(text: str) -> Tuple[str, str]:
         return text, ""
 
     body = m.group(1) or ""
-    # suffix starts right after body
     suf = text[len(body):]
-    # Ensure suffix truly ends with backslash-sequences (avoid false positives)
-    # If body is identical to text, don't split.
     if not suf:
         return text, ""
     return body, suf
@@ -88,7 +84,7 @@ def _is_id_like(tok: str) -> bool:
 def _split_lead_tail_ws(s: str) -> Tuple[str, str, str]:
     lead = _RE_WS_LEAD.match(s).group(0) if s else ""
     tail = _RE_WS_TAIL.search(s).group(0) if s else ""
-    core = s[len(lead): len(s) - len(tail)]
+    core = s[len(lead) : len(s) - len(tail)]
     return lead, core, tail
 
 
@@ -113,30 +109,29 @@ def _parse_rest_prefix_speaker_and_body(rest: str) -> Tuple[str, str, str, str]:
         body_raw, suf = _split_suffix(s)
         return lead_ws, "", body_raw, suf
 
-    # Tokenize by whitespace but keep reconstruction via spans.
-    # 1) Check for id-like first token.
+    # 1) id-like first token: may be (id + speaker + body) OR (id + body)
     m_id = re.match(r"^(\S+)(\s+)(.*)$", s)
     if m_id and _is_id_like(m_id.group(1)):
-        id_tok = m_id.group(1)
-        after_id = m_id.group(3)  # no leading spaces (already consumed by (\s+))
-        # We need the prefix to include: lead_ws + id_tok + original spaces after it.
-        prefix_base = lead_ws + s[: m_id.start(3)]  # includes id + spaces
+        after_id = m_id.group(3)  # text after id (no leading spaces)
+        prefix_base = lead_ws + s[: m_id.start(3)]  # includes id + original spaces after it
 
-        # Now inspect the next token after id, if any.
+        # Inspect next token after id, if any
         m_next = re.match(r"^(\S+)(\s+)(.*)$", after_id)
         if m_next:
             cand = m_next.group(1)
             rest_after_cand = m_next.group(3)
 
-            # Case: explicit speaker markers
+            # explicit speaker markers: @Name / #Name
             if cand.startswith(("@", "#")):
                 speaker = cand[1:].strip()
                 body_raw, suf = _split_suffix(rest_after_cand)
-                # prefix includes cand and the spaces after it
+
+                # prefix includes cand + following spaces, reconstructed via slice spans
+                # m_id.start(3) is start of after_id in s; m_next.start(3) is start of rest_after_cand in after_id
                 prefix = lead_ws + s[: m_id.start(3) + m_next.start(3)]
                 return prefix, speaker, body_raw, suf
 
-            # Case: "name speaker" (no @/#) only if body after it looks like dialogue
+            # bare speaker token only if body right after it clearly looks like dialogue
             if re.fullmatch(r"[A-Za-z0-9_]+", cand) and rest_after_cand.startswith(("", '"', "“", "「", "『")):
                 speaker = cand.strip()
                 body_raw, suf = _split_suffix(rest_after_cand)
@@ -157,7 +152,7 @@ def _parse_rest_prefix_speaker_and_body(rest: str) -> Tuple[str, str, str, str]:
             body_raw, suf = _split_suffix(rest_after)
             return prefix, cand.strip(), body_raw, suf
 
-    # 3) Fallback: treat as narration
+    # 3) Fallback: narration
     body_raw, suf = _split_suffix(s)
     return lead_ws, "", body_raw, suf
 
@@ -173,9 +168,11 @@ class MusicaParser:
                 return 0.9
         except Exception:
             pass
+
         fp = str(getattr(ctx, "file_path", "") or "")
         if fp.lower().endswith(".sc"):
             return 0.9
+
         head = "\n".join(text.splitlines()[:80])
         if ".message" in head and ".stage" in head:
             return 0.55
@@ -208,7 +205,7 @@ class MusicaParser:
                 continue
 
             # Preserve body outer whitespace separately to allow stable rebuild
-            body_lead, body_core, body_tail = _split_lead_tail_ws(body_raw)
+            body_lead, _body_core, body_tail = _split_lead_tail_ws(body_raw)
 
             entries.append(
                 {
@@ -251,6 +248,7 @@ class MusicaParser:
                     li = int(str(e.get("entry_id", "")).strip())
                 except Exception:
                     li = None
+
             if li is not None and 0 <= li < len(lines):
                 by_line[li] = e
 
@@ -287,4 +285,3 @@ class MusicaParser:
 
 
 plugin = MusicaParser()
-
