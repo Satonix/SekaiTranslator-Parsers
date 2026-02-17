@@ -21,6 +21,13 @@
       "name": "Musica SC",
       "min_ui_version": "0.1.0",
       "sha256": ""
+    },
+    {
+      "id": "kirikiri_dialect_test.ks",
+      "folder": "kirikiri_dialect_test",
+      "name": "KiriKiri Dialect Test (.ks)",
+      "min_ui_version": "0.7.0",
+      "sha256": ""
     }
   ]
 }
