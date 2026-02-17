@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from parsers.base import ParseContext
 
@@ -25,7 +25,22 @@ MAP_ENCODE: Dict[str, str] = {
 
 MAP_DECODE: Dict[str, str] = {v: k for k, v in MAP_ENCODE.items()}
 
-_RX_MESSAGE = re.compile(r"^(\s*)\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$")
+# Supports optional channel prefix like "[e]." / "[j]." before ".message"
+_RX_MESSAGE = re.compile(
+    r"^(\s*)"
+    r"(?:(\[[^\]]+\]\.)\s*)?"
+    r"\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$"
+)
+
+_RE_WS_LEAD = re.compile(r"^\s*")
+_RE_WS_TAIL = re.compile(r"\s*$")
+
+# Suffix control sequences at END of message text.
+# Covers: \a, \v, \v\a, \w, \w\w..., and also \something123 style.
+_RX_SUFFIX = re.compile(r"(?s)^(.*?)(\\(?:[A-Za-z]+[0-9]*))(\\(?:[A-Za-z]+[0-9]*))*?(\s*)$")
+
+# Control-only body like "\a" or "\w\w\w\a" (optionally with whitespace)
+_RX_CONTROL_ONLY = re.compile(r"^\s*(?:\\[A-Za-z]+[0-9]*)+\s*$")
 
 
 def _decode_table(s: str) -> str:
@@ -40,29 +55,25 @@ def _encode_table(s: str) -> str:
     return "".join(MAP_ENCODE.get(ch, ch) for ch in s)
 
 
-def _strip_outer_quotes(s: str) -> str:
-    if not s:
-        return s
-    t = s.strip()
-    if len(t) >= 2:
-        pairs = {
-            ('"', '"'),
-            ("“", "”"),
-            ("「", "」"),
-            ("『", "』"),
-        }
-        a, b = t[0], t[-1]
-        if (a, b) in pairs:
-            return t[1:-1]
-    return t
-
-
 def _split_suffix(text: str) -> Tuple[str, str]:
-    m = re.search(r"(?s)^(.*?)(\\(?:v\\a|a|v))+(\s*)$", text)
+    """
+    Split trailing control sequences (like \a, \v, \v\a, \w...) from the end.
+    Keeps suffix EXACTLY as in input (including any trailing spaces).
+    """
+    if not text:
+        return text, ""
+
+    m = _RX_SUFFIX.match(text)
     if not m:
         return text, ""
-    body = m.group(1)
-    suf = text[len(body) :]
+
+    body = m.group(1) or ""
+    # suffix starts right after body
+    suf = text[len(body):]
+    # Ensure suffix truly ends with backslash-sequences (avoid false positives)
+    # If body is identical to text, don't split.
+    if not suf:
+        return text, ""
     return body, suf
 
 
@@ -74,52 +85,64 @@ def _is_id_like(tok: str) -> bool:
     return any(ch.isdigit() for ch in tok)
 
 
-def _guess_speaker(rest: str) -> str:
-    s = rest.strip()
+def _split_lead_tail_ws(s: str) -> Tuple[str, str, str]:
+    lead = _RE_WS_LEAD.match(s).group(0) if s else ""
+    tail = _RE_WS_TAIL.search(s).group(0) if s else ""
+    core = s[len(lead): len(s) - len(tail)]
+    return lead, core, tail
+
+
+def _parse_rest_prefix_speaker_and_body(rest: str) -> Tuple[str, str, str, str]:
+    """
+    Returns (prefix, speaker, body_raw, suffix).
+
+    - prefix: everything (including spaces) before the body
+    - speaker: best-effort speaker name (without @/#), or ""
+    - body_raw: message body WITHOUT trailing suffix sequences
+    - suffix: trailing suffix sequences (e.g. "\v\a", "\w\w\a") and any trailing spaces
+    """
+    rest_no_nl = rest.rstrip("\r\n")
+
+    # Preserve the exact indentation inside the ".message" payload
+    lead_ws = rest_no_nl[: len(rest_no_nl) - len(rest_no_nl.lstrip(" "))]
+    s = rest_no_nl.lstrip(" ")
+
     if not s:
-        return ""
-    toks = s.split()
-    if len(toks) < 2:
-        return ""
-    if not _is_id_like(toks[0]):
-        return ""
-    sp = toks[1].strip()
-    if sp.startswith("#"):
-        sp = sp[1:]
-    if sp.startswith("@"):
-        sp = sp[1:]
-    sp = sp.replace("@", "").strip()
-    return sp
+        return lead_ws, "", "", ""
 
+    # Case A: id-like + speaker token + body
+    #   yuk-100_01-0005 @Yuuko g...h
+    #   miy-... #Miyako g...h
+    m = re.match(r"^([^\s]+)(\s+)([@#]?[^\s]+)(\s+)(.*)$", s)
+    if m and _is_id_like(m.group(1)):
+        _id = m.group(1)
+        who = m.group(3) or ""
+        sp = who
+        if sp.startswith("#") or sp.startswith("@"):
+            sp = sp[1:]
+        prefix = lead_ws + s[: m.start(5)]
+        body_plus = m.group(5) or ""
+        body_raw, suf = _split_suffix(body_plus)
+        return prefix, sp.strip(), body_raw, suf
 
-def _find_text_region(rest: str) -> Tuple[str, str, str]:
-    rest = rest.rstrip("\r\n")
-    lead_ws = rest[: len(rest) - len(rest.lstrip(" "))]
-    rest_strip = rest.lstrip(" ")
+    # Case B: plain speaker token + body starting with engine marker (...) or quote
+    #   Hiro gC-c-c-cold...h
+    # (We only do this when the remainder clearly looks like a quoted/marked line.)
+    m2 = re.match(r"^([A-Za-z0-9_]+)(\s+)(.*)$", s)
+    if m2:
+        who = m2.group(1) or ""
+        rest2 = m2.group(3) or ""
+        if rest2.startswith("") or rest2.startswith('"') or rest2.startswith("“") or rest2.startswith("「") or rest2.startswith("『"):
+            prefix = lead_ws + s[: m2.start(3)]
+            body_plus = rest2
+            body_raw, suf = _split_suffix(body_plus)
+            return prefix, who.strip(), body_raw, suf
 
-    qpos: Optional[int] = None
-    for ch in ("“", '"', "「", "『"):
-        i = rest_strip.find(ch)
-        if i != -1 and (qpos is None or i < qpos):
-            qpos = i
-
-    if qpos is not None:
-        prefix_strip = rest_strip[:qpos]
-        text_plus = rest_strip[qpos:]
-        body, suf = _split_suffix(text_plus)
-        return lead_ws + prefix_strip, body, suf
-
-    toks = rest_strip.split()
-    if len(toks) >= 3 and _is_id_like(toks[0]):
-        m = re.match(rf"^{re.escape(toks[0])}\s+{re.escape(toks[1])}\s+(.*)$", rest_strip)
-        if m:
-            prefix_strip = rest_strip[: m.start(1)]
-            text_plus = m.group(1)
-            body, suf = _split_suffix(text_plus)
-            return lead_ws + prefix_strip, body, suf
-
-    body, suf = _split_suffix(rest_strip)
-    return lead_ws, body, suf
+    # Case C: no reliable header; body begins immediately (narration, etc.)
+    prefix = lead_ws
+    body_plus = s
+    body_raw, suf = _split_suffix(body_plus)
+    return prefix, "", body_raw, suf
 
 
 class MusicaParser:
@@ -154,21 +177,26 @@ class MusicaParser:
             if not m:
                 continue
 
-            ws, sp1, msgno, sp2, rest, nl = m.groups()
-            prefix, body_raw, suf = _find_text_region(rest)
+            ws, chan, sp1, msgno, sp2, rest, nl = m.groups()
 
+            prefix, speaker, body_raw, suf = _parse_rest_prefix_speaker_and_body(rest)
+
+            # Decode exactly (do NOT strip quotes or tags/markers)
             visible = _decode_table(body_raw)
-            visible = _strip_outer_quotes(visible)
 
-            if visible.strip() == "":
+            # Skip empty or control-only messages (e.g. "\a" / "\w\w\a")
+            if visible == "" or visible.strip() == "":
+                continue
+            if _RX_CONTROL_ONLY.match(visible):
                 continue
 
-            speaker = _guess_speaker(rest)
+            # Preserve body outer whitespace separately to allow stable rebuild
+            body_lead, body_core, body_tail = _split_lead_tail_ws(body_raw)
 
             entries.append(
                 {
                     "entry_id": f"{i}",
-                    "original": visible,
+                    "original": _decode_table(body_raw),  # keep EXACT formatting/tags/spaces
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
@@ -176,12 +204,15 @@ class MusicaParser:
                     "meta": {
                         "line_index": i,
                         "ws": ws,
+                        "chan": chan or "",
                         "sp1": sp1,
                         "msgno": msgno,
                         "sp2": sp2,
                         "prefix": prefix,
                         "suffix": suf,
                         "newline": nl or "",
+                        "body_lead": body_lead,
+                        "body_tail": body_tail,
                     },
                 }
             )
@@ -212,23 +243,28 @@ class MusicaParser:
             if not m:
                 continue
 
-            ws, sp1, msgno, sp2, _, nl = m.groups()
+            ws, chan, sp1, msgno, sp2, _rest, nl = m.groups()
 
             meta = e.get("meta") or {}
             prefix = str(meta.get("prefix") or "")
             suf = str(meta.get("suffix") or "")
             newline = str(meta.get("newline") or (nl or ""))
+            body_lead = str(meta.get("body_lead") or "")
+            body_tail = str(meta.get("body_tail") or "")
 
             tr = e.get("translation")
-            if isinstance(tr, str) and tr.strip():
-                body = tr.strip()
+            if isinstance(tr, str) and tr != "":
+                body_txt = tr  # do NOT strip; user may want exact spacing/tags
             else:
-                body = str(e.get("original") or "").strip()
+                body_txt = str(e.get("original") or "")
 
-            body = _strip_outer_quotes(body)
-            body = _encode_table(body)
+            # Encode only the body text; keep original lead/tail whitespace around it
+            body_txt_enc = _encode_table(body_txt)
+            body_txt_enc = f"{body_lead}{body_txt_enc}{body_tail}"
 
-            lines[li] = f"{ws}.message{sp1}{msgno}{sp2}{prefix}{body}{suf}{newline}"
+            chan_s = str(meta.get("chan") or (chan or ""))
+
+            lines[li] = f"{ws}{chan_s}.message{sp1}{msgno}{sp2}{prefix}{body_txt_enc}{suf}{newline}"
 
         return "".join(lines)
 
