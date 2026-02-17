@@ -6,19 +6,24 @@ from typing import Dict, Optional, Tuple
 
 from parsers.base import ParseContext
 
-
 # ============================================================
 # Shared helpers (round-trip safe)
 # ============================================================
 
 @dataclass(frozen=True)
 class TextRegion:
-    head: str   # everything before editable text (exact)
-    text: str   # editable text (decoded for UI)
-    tail: str   # everything after editable text (exact)
+    head: str  # everything before editable text (exact)
+    text: str  # editable text (decoded for UI)
+    tail: str  # everything after editable text (exact)
 
 
 def split_suffix_controls(text: str) -> Tuple[str, str]:
+    """
+    Split trailing control sequences at END of text:
+    \a, \v, \v\a, \w, \w\w..., \something123 etc.
+
+    Returns: (body, suffix) where suffix keeps original spacing.
+    """
     if not text:
         return text, ""
 
@@ -35,7 +40,6 @@ def split_suffix_controls(text: str) -> Tuple[str, str]:
 
 
 _RX_CONTROL_ONLY = re.compile(r"^\s*(?:\\[A-Za-z]+[0-9]*)+\s*$")
-
 
 # ============================================================
 # Base class for line-command parsers
@@ -81,13 +85,13 @@ class LineCommandParserBase:
                 continue
 
             region = self._extract_region(m)
+
             if region.text == "" or region.text.strip() == "":
                 continue
             if _RX_CONTROL_ONLY.match(region.text):
                 continue
 
-            e = self._make_entry(m, region, i)
-            entries.append(e)
+            entries.append(self._make_entry(m, region, i))
 
         return entries
 
@@ -122,7 +126,6 @@ class LineCommandParserBase:
 
         return "".join(lines)
 
-
 # ============================================================
 # MusicaTest (.sc)
 # ============================================================
@@ -143,7 +146,6 @@ MAP_ENCODE: Dict[str, str] = {
     "ó": ")",
     "õ": "*",
 }
-
 MAP_DECODE: Dict[str, str] = {v: k for k, v in MAP_ENCODE.items()}
 
 
@@ -159,21 +161,19 @@ def encode_table(s: str) -> str:
     return "".join(MAP_ENCODE.get(ch, ch) for ch in s)
 
 
-def is_id_like(tok: str) -> bool:
-    if not tok or "-" not in tok:
-        return False
-    return any(ch.isdigit() for ch in tok)
-
-
 class MusicaTest(LineCommandParserBase):
     plugin_id = "musica_test.sc"
     name = "MusicaTest (.sc)"
     extensions = {".sc"}
 
     _RX = re.compile(
-        r"^(\s*)"
-        r"(?:(\[[^\]]+\]\.)\s*)?"
-        r"\.message(\s+)(\d+)(\s+)(.*?)(\r?\n)?$"
+        r"^(\s*)"              # ws
+        r"(?:(\[[^\]]+\]\.)\s*)?"  # optional channel prefix like [e].
+        r"\.message(\s+)"      # after .message
+        r"(\d+)"               # msgno
+        r"(\s+)"               # spacing after msgno
+        r"(.*?)"               # rest
+        r"(\r?\n)?$"           # newline
     )
 
     def detect(self, ctx: ParseContext, text: str) -> float:
@@ -191,20 +191,18 @@ class MusicaTest(LineCommandParserBase):
         ws, chan, sp1, msgno, sp2, rest, nl = m.groups()
         nl = nl or ""
 
+        # Keep exact spaces that exist before the actual text in "rest"
         rest_no_nl = rest.rstrip("\r\n")
         lead_ws = rest_no_nl[: len(rest_no_nl) - len(rest_no_nl.lstrip(" "))]
         s = rest_no_nl.lstrip(" ")
 
         if not s:
+            # nothing editable
             head = f"{ws}{chan or ''}.message{sp1}{msgno}{sp2}{rest_no_nl}{nl}"
             return TextRegion(head=head, text="", tail="")
 
-        prefix_inside_rest = lead_ws
-        raw_text_plus = s
-
-        raw_body, suf = split_suffix_controls(raw_text_plus)
-
-        head = f"{ws}{(chan or '')}.message{sp1}{msgno}{sp2}{prefix_inside_rest}"
+        raw_body, suf = split_suffix_controls(s)
+        head = f"{ws}{(chan or '')}.message{sp1}{msgno}{sp2}{lead_ws}"
         tail = f"{suf}{nl}"
 
         decoded = decode_table(raw_body)
