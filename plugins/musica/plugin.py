@@ -94,55 +94,72 @@ def _split_lead_tail_ws(s: str) -> Tuple[str, str, str]:
 
 def _parse_rest_prefix_speaker_and_body(rest: str) -> Tuple[str, str, str, str]:
     """
-    Returns (prefix, speaker, body_raw, suffix).
-
-    - prefix: everything (including spaces) before the body
-    - speaker: best-effort speaker name (without @/#), or ""
-    - body_raw: message body WITHOUT trailing suffix sequences
-    - suffix: trailing suffix sequences (e.g. "\v\a", "\w\w\a") and any trailing spaces
+    Returns (prefix, speaker, body_raw, suffix)
+    - prefix: everything before body (keeps exact spacing)
+    - speaker: best-effort speaker or ""
+    - body_raw: raw body (no suffix removed yet)
+    - suffix: trailing control sequences like \v\a, \w... (kept exact)
     """
     rest_no_nl = rest.rstrip("\r\n")
 
-    # Preserve the exact indentation inside the ".message" payload
     lead_ws = rest_no_nl[: len(rest_no_nl) - len(rest_no_nl.lstrip(" "))]
     s = rest_no_nl.lstrip(" ")
 
     if not s:
         return lead_ws, "", "", ""
 
-    # Case A: id-like + speaker token + body
-    #   yuk-100_01-0005 @Yuuko g...h
-    #   miy-... #Miyako g...h
-    m = re.match(r"^([^\s]+)(\s+)([@#]?[^\s]+)(\s+)(.*)$", s)
-    if m and _is_id_like(m.group(1)):
-        _id = m.group(1)
-        who = m.group(3) or ""
-        sp = who
-        if sp.startswith("#") or sp.startswith("@"):
-            sp = sp[1:]
-        prefix = lead_ws + s[: m.start(5)]
-        body_plus = m.group(5) or ""
-        body_raw, suf = _split_suffix(body_plus)
-        return prefix, sp.strip(), body_raw, suf
+    # If body clearly begins right away (quotes/markers), treat as narration.
+    if s.startswith(("", '"', "“", "「", "『")):
+        body_raw, suf = _split_suffix(s)
+        return lead_ws, "", body_raw, suf
 
-    # Case B: plain speaker token + body starting with engine marker (...) or quote
-    #   Hiro gC-c-c-cold...h
-    # (We only do this when the remainder clearly looks like a quoted/marked line.)
-    m2 = re.match(r"^([A-Za-z0-9_]+)(\s+)(.*)$", s)
-    if m2:
-        who = m2.group(1) or ""
-        rest2 = m2.group(3) or ""
-        if rest2.startswith("") or rest2.startswith('"') or rest2.startswith("“") or rest2.startswith("「") or rest2.startswith("『"):
-            prefix = lead_ws + s[: m2.start(3)]
-            body_plus = rest2
-            body_raw, suf = _split_suffix(body_plus)
-            return prefix, who.strip(), body_raw, suf
+    # Tokenize by whitespace but keep reconstruction via spans.
+    # 1) Check for id-like first token.
+    m_id = re.match(r"^(\S+)(\s+)(.*)$", s)
+    if m_id and _is_id_like(m_id.group(1)):
+        id_tok = m_id.group(1)
+        after_id = m_id.group(3)  # no leading spaces (already consumed by (\s+))
+        # We need the prefix to include: lead_ws + id_tok + original spaces after it.
+        prefix_base = lead_ws + s[: m_id.start(3)]  # includes id + spaces
 
-    # Case C: no reliable header; body begins immediately (narration, etc.)
-    prefix = lead_ws
-    body_plus = s
-    body_raw, suf = _split_suffix(body_plus)
-    return prefix, "", body_raw, suf
+        # Now inspect the next token after id, if any.
+        m_next = re.match(r"^(\S+)(\s+)(.*)$", after_id)
+        if m_next:
+            cand = m_next.group(1)
+            rest_after_cand = m_next.group(3)
+
+            # Case: explicit speaker markers
+            if cand.startswith(("@", "#")):
+                speaker = cand[1:].strip()
+                body_raw, suf = _split_suffix(rest_after_cand)
+                # prefix includes cand and the spaces after it
+                prefix = lead_ws + s[: m_id.start(3) + m_next.start(3)]
+                return prefix, speaker, body_raw, suf
+
+            # Case: "name speaker" (no @/#) only if body after it looks like dialogue
+            if re.fullmatch(r"[A-Za-z0-9_]+", cand) and rest_after_cand.startswith(("", '"', "“", "「", "『")):
+                speaker = cand.strip()
+                body_raw, suf = _split_suffix(rest_after_cand)
+                prefix = lead_ws + s[: m_id.start(3) + m_next.start(3)]
+                return prefix, speaker, body_raw, suf
+
+        # Otherwise: id-like but NO speaker => body starts immediately after id
+        body_raw, suf = _split_suffix(after_id)
+        return prefix_base, "", body_raw, suf
+
+    # 2) No id-like: maybe "Speaker Body" (e.g. "Hiro g...h")
+    m_sp = re.match(r"^([A-Za-z0-9_]+)(\s+)(.*)$", s)
+    if m_sp:
+        cand = m_sp.group(1)
+        rest_after = m_sp.group(3)
+        if rest_after.startswith(("", '"', "“", "「", "『")):
+            prefix = lead_ws + s[: m_sp.start(3)]
+            body_raw, suf = _split_suffix(rest_after)
+            return prefix, cand.strip(), body_raw, suf
+
+    # 3) Fallback: treat as narration
+    body_raw, suf = _split_suffix(s)
+    return lead_ws, "", body_raw, suf
 
 
 class MusicaParser:
@@ -270,3 +287,4 @@ class MusicaParser:
 
 
 plugin = MusicaParser()
+
