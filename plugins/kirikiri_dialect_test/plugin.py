@@ -1,4 +1,4 @@
-# plugins/kirikiri/plugin.py
+# plugins/kirikiri_dialect_test/plugin.py
 from __future__ import annotations
 
 import re
@@ -8,14 +8,15 @@ from parsers.base import ParseContext
 
 
 # ----------------------------
-# Kirikiri/KAG patterns
+# KiriKiri / KAG (dialect rules)
 # ----------------------------
-
-_RX_COMMENT = re.compile(r"^\s*;")           # ; comment
+_RX_COMMENT = re.compile(r"^\s*;")          # ; comment
 _RX_LABEL = re.compile(r"^\s*\*")           # *label or *|
-_RX_INLINE_CMD = re.compile(r"^\s*@")       # @font etc (keep as code)
-_RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+$")  # line is only [tags]
+_RX_INLINE_CMD = re.compile(r"^\s*@")       # @font etc
+_RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+$")  # only [tags] on the line
 
+# Speaker tag used in your scripts:
+# [P_NAME s_cn="Subaru"]
 _RX_SPEAKER = re.compile(
     r"""\[\s*P_NAME\b[^]]*?\bs_cn\s*=\s*"([^"]+)"[^]]*]""",
     re.IGNORECASE,
@@ -37,11 +38,10 @@ def _extract_prefix_and_body(before_cr: str) -> Tuple[str, str]:
     before_cr = line[:idx_cr] (everything before the FIRST "[cr]")
 
     Dialect rule:
-      - Lines may start with ';;' and STILL be active text.
-        We keep ';;' + immediate spaces in the prefix, and translate only the rest.
+    - Lines may start with ';;' and STILL be active text.
+      We keep ';;' + immediate spaces in the prefix, and translate only the rest.
 
-    Returns:
-      (prefix, body)
+    Returns: (prefix, body)
     """
     lead_ws, rest = _split_leading_ws(before_cr)
 
@@ -62,7 +62,7 @@ def _is_translatable_body(body: str) -> bool:
     if body.strip() == "":
         return False
 
-    # Avoid weird cases where a tag line accidentally includes [cr]
+    # Avoid cases where a tag-only line accidentally has [cr]
     if _RX_TAG_ONLY.match(body):
         return False
 
@@ -74,16 +74,16 @@ def _is_translatable_body(body: str) -> bool:
     return True
 
 
-class KirikiriParser:
-    plugin_id = "kirikiri.ks"
-    name = "Kirikiri KAG (.ks)"
+class KirikiriDialectTestParser:
+    plugin_id = "kirikiri_dialect_test.ks"
+    name = "KiriKiri Dialect Test (.ks)"
     extensions = {".ks"}
 
     # --------------------------------------------------
     # Detect
     # --------------------------------------------------
     def detect(self, ctx: ParseContext, text: str) -> float:
-        # Prefer extension signal when available
+        # Prefer extension signal
         try:
             if getattr(ctx, "path", None) is not None and ctx.path.suffix.lower() == ".ks":
                 return 0.95
@@ -95,10 +95,10 @@ class KirikiriParser:
             return 0.95
 
         # Heuristic
-        head = "\n".join(text.splitlines()[:160])
+        head = "\n".join(text.splitlines()[:200])
         score = 0.0
         if "[cr]" in head:
-            score += 0.25
+            score += 0.30
         if "[cm]" in head:
             score += 0.25
         if "[P_NAME" in head or "[P_FACE" in head:
@@ -124,7 +124,7 @@ class KirikiriParser:
                 current_speaker = (msp.group(1) or "").strip()
                 continue
 
-            # Skip structural / non-dialogue lines
+            # Skip structural/non-dialogue lines
             if _RX_COMMENT.match(line):
                 continue
             if _RX_LABEL.match(line):
@@ -140,14 +140,14 @@ class KirikiriParser:
             after_cr = line[idx_cr:]  # includes [cr] and everything after, including newline
 
             prefix, body = _extract_prefix_and_body(before_cr)
+
             if not _is_translatable_body(body):
                 continue
 
-            # Keep EXACT body (no stripping)
             entries.append(
                 {
                     "entry_id": f"{i}",
-                    "original": body,
+                    "original": body,  # keep EXACT body (no stripping)
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
@@ -170,6 +170,7 @@ class KirikiriParser:
         lines = out.splitlines(keepends=True)
 
         by_line: Dict[int, dict] = {}
+
         for e in entries:
             meta = e.get("meta") or {}
             li: Optional[int] = None
@@ -206,4 +207,4 @@ class KirikiriParser:
         return "".join(lines)
 
 
-plugin = KirikiriParser()
+plugin = KirikiriDialectTestParser()
