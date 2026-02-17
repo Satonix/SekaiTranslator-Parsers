@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from parsers.base import ParseContext
 
@@ -10,9 +10,9 @@ from parsers.base import ParseContext
 # ----------------------------
 # KiriKiri / KAG (dialect rules)
 # ----------------------------
-_RX_COMMENT = re.compile(r"^\s*;")                 # ; or ;; comment
-_RX_LABEL = re.compile(r"^\s*\*")                  # *label or *|
-_RX_INLINE_CMD = re.compile(r"^\s*@")              # @font etc
+_RX_COMMENT = re.compile(r"^\s*;")          # ; comment
+_RX_LABEL = re.compile(r"^\s*\*")           # *label or *|
+_RX_INLINE_CMD = re.compile(r"^\s*@")       # @font etc
 _RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+$")  # only [tags] on the line
 
 # Speaker tag used in your scripts:
@@ -33,14 +33,26 @@ def _split_leading_ws(s: str) -> Tuple[str, str]:
     return s[:i], s[i:]
 
 
-def _extract_prefix_and_body(before_marker: str) -> Tuple[str, str]:
+def _extract_prefix_and_body(before_tag: str) -> Tuple[str, str]:
     """
-    before_marker = line[:idx_marker] (everything before the FIRST [r]/[cr])
+    before_tag = line[:idx_tag] (everything before the FIRST "[r]" or "[cr]")
 
-    For this dialect, lines starting with ';' are already filtered out.
-    We keep leading whitespace in prefix and translate the rest.
+    Dialect rule:
+    - Lines may start with ';;' and STILL be active text.
+      We keep ';;' + immediate spaces in the prefix, and translate only the rest.
+
+    Returns: (prefix, body)
     """
-    lead_ws, rest = _split_leading_ws(before_marker)
+    lead_ws, rest = _split_leading_ws(before_tag)
+
+    if rest.startswith(";;"):
+        j = 2
+        while j < len(rest) and rest[j] in (" ", "\t"):
+            j += 1
+        prefix = lead_ws + rest[:j]  # includes ';;' and following spaces
+        body = rest[j:]
+        return prefix, body
+
     return lead_ws, rest
 
 
@@ -50,38 +62,16 @@ def _is_translatable_body(body: str) -> bool:
     if body.strip() == "":
         return False
 
-    # avoid tag-only cases
+    # Avoid cases where a tag-only line accidentally has [r]/[cr]
     if _RX_TAG_ONLY.match(body):
         return False
 
-    # if removing tags leaves nothing, it's not real text
+    # If body becomes empty after removing [tags] => not real text
     tmp = _RX_ANY_TAG.sub("", body)
     if tmp.strip() == "":
         return False
 
     return True
-
-
-def _find_first_marker(line: str) -> Tuple[int, str] | Tuple[int, None]:
-    """
-    Returns (index, marker) where marker is "[r]" or "[cr]".
-    Chooses the earliest occurrence among them.
-    """
-    i_r = line.find("[r]")
-    i_cr = line.find("[cr]")
-
-    if i_r < 0 and i_cr < 0:
-        return -1, None
-
-    if i_r < 0:
-        return i_cr, "[cr]"
-    if i_cr < 0:
-        return i_r, "[r]"
-
-    # both exist, pick earliest
-    if i_r <= i_cr:
-        return i_r, "[r]"
-    return i_cr, "[cr]"
 
 
 class KirikiriDialectTestParser:
@@ -93,6 +83,7 @@ class KirikiriDialectTestParser:
     # Detect
     # --------------------------------------------------
     def detect(self, ctx: ParseContext, text: str) -> float:
+        # Prefer extension signal
         try:
             if getattr(ctx, "path", None) is not None and ctx.path.suffix.lower() == ".ks":
                 return 0.95
@@ -103,6 +94,7 @@ class KirikiriDialectTestParser:
         if fp.lower().endswith(".ks"):
             return 0.95
 
+        # Heuristic
         head = "\n".join(text.splitlines()[:200])
         score = 0.0
         if "[cr]" in head or "[r]" in head:
@@ -125,48 +117,42 @@ class KirikiriDialectTestParser:
 
         current_speaker: str = ""
 
-        # Buffer for multi-line message (joined by \n in editor)
-        buf_line_idxs: List[int] = []
-        buf_prefixes: List[str] = []
-        buf_after_markers: List[str] = []
-        buf_bodies: List[str] = []
-        buf_speaker: str = ""
+        buffer_bodies: list[str] = []
+        buffer_lines: list[dict] = []
 
-        def _flush_buffer() -> None:
-            nonlocal buf_line_idxs, buf_prefixes, buf_after_markers, buf_bodies, buf_speaker
-
-            if not buf_line_idxs:
+        def flush_buffer() -> None:
+            if not buffer_bodies:
                 return
 
-            # Build editor text as lines joined by '\n'
-            original_joined = "\n".join(buf_bodies)
+            # Editor: juntar em uma linha (evita aparecer como 2 linhas no editor)
+            # Mantém o texto “humano” sem os tags [r]/[cr].
+            joined = " ".join(b.strip() for b in buffer_bodies).strip()
+            if not joined:
+                buffer_bodies.clear()
+                buffer_lines.clear()
+                return
 
-            # entry_id anchored at first line index (stable)
-            first_i = buf_line_idxs[0]
+            first = buffer_lines[0]
             entries.append(
                 {
-                    "entry_id": f"{first_i}",
-                    "original": original_joined,  # EXACT bodies, joined
+                    "entry_id": str(first["line_index"]),
+                    "original": joined,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
-                    "speaker": buf_speaker,
+                    "speaker": current_speaker,
                     "meta": {
-                        "line_indexes": list(buf_line_idxs),
-                        "prefixes": list(buf_prefixes),
-                        "after_markers": list(buf_after_markers),
+                        # lista de linhas que compõem este bloco (cada uma termina em [r] ou [cr])
+                        "lines": buffer_lines.copy(),
                     },
                 }
             )
 
-            buf_line_idxs = []
-            buf_prefixes = []
-            buf_after_markers = []
-            buf_bodies = []
-            buf_speaker = ""
+            buffer_bodies.clear()
+            buffer_lines.clear()
 
         for i, line in enumerate(lines):
-            # Track speaker tag
+            # Track speaker tag, do not emit entry for it
             msp = _RX_SPEAKER.search(line)
             if msp:
                 current_speaker = (msp.group(1) or "").strip()
@@ -180,42 +166,46 @@ class KirikiriDialectTestParser:
             if _RX_INLINE_CMD.match(line):
                 continue
 
-            idx_marker, marker = _find_first_marker(line)
-            if idx_marker < 0 or marker is None:
-                # If we were buffering a message and hit a non-text line, flush.
-                _flush_buffer()
+            # Find earliest [r] or [cr]
+            idx_r = line.find("[r]")
+            idx_cr = line.find("[cr]")
+
+            idx = -1
+            tag = ""
+
+            if idx_r >= 0 and (idx_cr < 0 or idx_r < idx_cr):
+                idx = idx_r
+                tag = "[r]"
+            elif idx_cr >= 0:
+                idx = idx_cr
+                tag = "[cr]"
+
+            if idx < 0:
                 continue
 
-            before = line[:idx_marker]
-            after = line[idx_marker:]  # includes marker and everything after, including newline
+            before_tag = line[:idx]
+            after_tag = line[idx:]  # includes [r]/[cr] and everything after (incl newline)
 
-            prefix, body = _extract_prefix_and_body(before)
+            prefix, body = _extract_prefix_and_body(before_tag)
 
             if not _is_translatable_body(body):
-                # Not a real text line. If buffer open, flush to avoid swallowing.
-                _flush_buffer()
                 continue
 
-            # Start buffer if empty
-            if not buf_line_idxs:
-                buf_speaker = current_speaker
+            buffer_bodies.append(body)
+            buffer_lines.append(
+                {
+                    "line_index": i,
+                    "prefix": prefix,
+                    "after_tag": after_tag,
+                }
+            )
 
-            # If speaker changed mid-buffer, flush and start a new one
-            if buf_line_idxs and buf_speaker != current_speaker:
-                _flush_buffer()
-                buf_speaker = current_speaker
+            # Finaliza bloco somente em [cr]
+            if tag == "[cr]":
+                flush_buffer()
 
-            buf_line_idxs.append(i)
-            buf_prefixes.append(prefix)
-            buf_after_markers.append(after)
-            buf_bodies.append(body)
-
-            # End of message block on [cr]
-            if marker == "[cr]":
-                _flush_buffer()
-
-        # flush at end
-        _flush_buffer()
+        # Se arquivo terminar no meio, flush mesmo assim (seguro)
+        flush_buffer()
 
         return entries
 
@@ -226,54 +216,38 @@ class KirikiriDialectTestParser:
         out = ctx.original_text
         lines = out.splitlines(keepends=True)
 
+        # Para cada entry, reescreve as linhas do bloco.
         for e in entries:
             meta = e.get("meta") or {}
-            idxs = meta.get("line_indexes")
-            prefixes = meta.get("prefixes")
-            afters = meta.get("after_markers")
-
-            if not (isinstance(idxs, list) and isinstance(prefixes, list) and isinstance(afters, list)):
-                continue
-            if not (len(idxs) == len(prefixes) == len(afters) and len(idxs) > 0):
+            line_infos = meta.get("lines") or []
+            if not isinstance(line_infos, list) or not line_infos:
                 continue
 
+            # Texto escolhido (tradução se existir, senão original)
             tr = e.get("translation")
             if isinstance(tr, str) and tr != "":
-                txt = tr
+                joined_text = tr  # preserva exatamente o que o usuário digitou
             else:
-                txt = str(e.get("original") or "")
+                joined_text = str(e.get("original") or "")
 
-            # Split editor text back into per-line bodies
-            parts = txt.split("\n")
-
-            # Normalize parts length to match original line count
-            n = len(idxs)
-            if len(parts) < n:
-                parts = parts + [""] * (n - len(parts))
-            elif len(parts) > n:
-                # Join extra lines into the last part to avoid losing data
-                parts = parts[: n - 1] + ["\n".join(parts[n - 1 :])]
-
-            for j in range(n):
-                li = idxs[j]
-                if not isinstance(li, int):
-                    try:
-                        li = int(li)
-                    except Exception:
-                        continue
+            # Reaplica o texto inteiro na primeira linha do bloco
+            # e limpa o corpo das linhas seguintes (mantendo prefix e tags).
+            for idx, info in enumerate(line_infos):
+                try:
+                    li = int(info.get("line_index"))
+                except Exception:
+                    continue
                 if not (0 <= li < len(lines)):
                     continue
 
-                # Safety: only rewrite if the target line still has [r]/[cr]
-                idx_marker, marker = _find_first_marker(lines[li])
-                if idx_marker < 0 or marker is None:
-                    continue
+                prefix = str(info.get("prefix") or "")
+                after_tag = str(info.get("after_tag") or "")
 
-                prefix = str(prefixes[j] or "")
-                after = str(afters[j] or lines[li][idx_marker:])
-
-                body_txt = parts[j]
-                lines[li] = f"{prefix}{body_txt}{after}"
+                if idx == 0:
+                    lines[li] = f"{prefix}{joined_text}{after_tag}"
+                else:
+                    # Mantém estrutura, remove corpo duplicado
+                    lines[li] = f"{prefix}{after_tag}"
 
         return "".join(lines)
 
