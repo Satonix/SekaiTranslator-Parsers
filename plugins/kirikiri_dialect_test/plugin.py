@@ -1,3 +1,4 @@
+# plugins/kirikiri/plugin.py
 from __future__ import annotations
 
 import re
@@ -7,21 +8,19 @@ from parsers.base import ParseContext
 
 
 # ----------------------------
-# Kirikiri (KAG) dialect helpers
+# Kirikiri/KAG patterns
 # ----------------------------
 
-_RX_LABEL = re.compile(r"^\s*\*")  # *label or *|
-_RX_COMMENT = re.compile(r"^\s*;")  # real comment
-_RX_INLINE_CMD = re.compile(r"^\s*@")  # @font, etc (do not translate)
-_RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+$")  # only [tags] on the line
+_RX_COMMENT = re.compile(r"^\s*;")           # ; comment
+_RX_LABEL = re.compile(r"^\s*\*")           # *label or *|
+_RX_INLINE_CMD = re.compile(r"^\s*@")       # @font etc (keep as code)
+_RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+$")  # line is only [tags]
 
-# Speaker lines: [P_NAME s_cn="Subaru"] (variant spacing tolerated)
 _RX_SPEAKER = re.compile(
     r"""\[\s*P_NAME\b[^]]*?\bs_cn\s*=\s*"([^"]+)"[^]]*]""",
     re.IGNORECASE,
 )
 
-# Any bracket tag (used for some heuristics)
 _RX_ANY_TAG = re.compile(r"\[[^\]]+\]")
 
 
@@ -33,46 +32,41 @@ def _split_leading_ws(s: str) -> Tuple[str, str]:
     return s[:i], s[i:]
 
 
-def _extract_translatable_from_pre(pre: str) -> Tuple[str, str]:
+def _extract_prefix_and_body(before_cr: str) -> Tuple[str, str]:
     """
-    pre = line[:idx_cr] (everything before the first [cr])
+    before_cr = line[:idx_cr] (everything before the FIRST "[cr]")
+
+    Dialect rule:
+      - Lines may start with ';;' and STILL be active text.
+        We keep ';;' + immediate spaces in the prefix, and translate only the rest.
 
     Returns:
       (prefix, body)
-      - prefix: leading whitespace + optional ';;' markers kept verbatim
-      - body: the translatable text (kept verbatim)
     """
-    lead_ws, rest = _split_leading_ws(pre)
+    lead_ws, rest = _split_leading_ws(before_cr)
 
-    # Dialect: lines can begin with ';;' and still be active text.
     if rest.startswith(";;"):
-        # Keep ';;' and any immediate spaces as part of prefix.
         j = 2
         while j < len(rest) and rest[j] in (" ", "\t"):
             j += 1
-        prefix = lead_ws + rest[:j]
+        prefix = lead_ws + rest[:j]  # includes ';;' and following spaces
         body = rest[j:]
         return prefix, body
 
-    prefix = lead_ws
-    body = rest
-    return prefix, body
+    return lead_ws, rest
 
 
 def _is_translatable_body(body: str) -> bool:
     if body is None:
         return False
-
-    # If empty/whitespace => not translatable
     if body.strip() == "":
         return False
 
-    # Pure tag line (rare, but safe)
+    # Avoid weird cases where a tag line accidentally includes [cr]
     if _RX_TAG_ONLY.match(body):
         return False
 
-    # If body is only tags + whitespace => not translatable
-    # (e.g., "[cm]" accidentally paired with [cr])
+    # If body becomes empty after removing tags => not real text
     tmp = _RX_ANY_TAG.sub("", body)
     if tmp.strip() == "":
         return False
@@ -80,19 +74,16 @@ def _is_translatable_body(body: str) -> bool:
     return True
 
 
-# ----------------------------
-# Parser
-# ----------------------------
-
-class KirikiriDialectParser:
-    # IMPORTANT: plugin_id should match the folder name used in your plugin manager
-    # (commonly used as directory key). Adjust if your installer expects another convention.
-    plugin_id = "kirikiri_dialect_test"
-    name = "Kirikiri Dialect Test (.ks)"
+class KirikiriParser:
+    plugin_id = "kirikiri.ks"
+    name = "Kirikiri KAG (.ks)"
     extensions = {".ks"}
 
+    # --------------------------------------------------
+    # Detect
+    # --------------------------------------------------
     def detect(self, ctx: ParseContext, text: str) -> float:
-        # Strong signal: .ks file
+        # Prefer extension signal when available
         try:
             if getattr(ctx, "path", None) is not None and ctx.path.suffix.lower() == ".ks":
                 return 0.95
@@ -103,13 +94,23 @@ class KirikiriDialectParser:
         if fp.lower().endswith(".ks"):
             return 0.95
 
-        # Heuristic: KAG tags and [cr] presence
-        head = "\n".join(text.splitlines()[:120])
-        if "[cr]" in head and ("[cm]" in head or "[P_NAME" in head or "[playbgm" in head):
-            return 0.65
+        # Heuristic
+        head = "\n".join(text.splitlines()[:160])
+        score = 0.0
+        if "[cr]" in head:
+            score += 0.25
+        if "[cm]" in head:
+            score += 0.25
+        if "[P_NAME" in head or "[P_FACE" in head:
+            score += 0.25
+        if "[playbgm" in head or "[playse" in head or "[jump" in head:
+            score += 0.15
 
-        return 0.0
+        return min(0.9, score)
 
+    # --------------------------------------------------
+    # Parse
+    # --------------------------------------------------
     def parse(self, ctx: ParseContext, text: str) -> list[dict]:
         entries: list[dict] = []
         lines = text.splitlines(keepends=True)
@@ -117,17 +118,16 @@ class KirikiriDialectParser:
         current_speaker: str = ""
 
         for i, line in enumerate(lines):
-            # Track speaker (do not create an entry for speaker tags)
+            # Track speaker tag, do not emit entry for it
             msp = _RX_SPEAKER.search(line)
             if msp:
                 current_speaker = (msp.group(1) or "").strip()
                 continue
 
-            # Skip non-text structural lines
+            # Skip structural / non-dialogue lines
             if _RX_COMMENT.match(line):
                 continue
             if _RX_LABEL.match(line):
-                # includes *| and *labels
                 continue
             if _RX_INLINE_CMD.match(line):
                 continue
@@ -136,37 +136,35 @@ class KirikiriDialectParser:
             if idx_cr < 0:
                 continue
 
-            pre = line[:idx_cr]
-            post = line[idx_cr:]  # includes [cr] and any trailing stuff + newline
+            before_cr = line[:idx_cr]
+            after_cr = line[idx_cr:]  # includes [cr] and everything after, including newline
 
-            # Extract prefix/body from the part before [cr]
-            prefix, body = _extract_translatable_from_pre(pre)
-
+            prefix, body = _extract_prefix_and_body(before_cr)
             if not _is_translatable_body(body):
                 continue
 
-            # Keep EXACT text (no strip) for stability
-            original_text = body
-
-            # Meta stores how to rebuild the line exactly
+            # Keep EXACT body (no stripping)
             entries.append(
                 {
                     "entry_id": f"{i}",
-                    "original": original_text,
+                    "original": body,
                     "translation": "",
                     "status": "untranslated",
                     "is_translatable": True,
                     "speaker": current_speaker,
                     "meta": {
                         "line_index": i,
-                        "prefix": prefix,   # includes ws + optional ';; ' prefix
-                        "post": post,       # begins with [cr] (kept exact)
+                        "prefix": prefix,
+                        "after_cr": after_cr,
                     },
                 }
             )
 
         return entries
 
+    # --------------------------------------------------
+    # Rebuild
+    # --------------------------------------------------
     def rebuild(self, ctx: ParseContext, entries: list[dict]) -> str:
         out = ctx.original_text
         lines = out.splitlines(keepends=True)
@@ -195,18 +193,17 @@ class KirikiriDialectParser:
 
             meta = e.get("meta") or {}
             prefix = str(meta.get("prefix") or "")
-            post = str(meta.get("post") or line[idx_cr:])
+            after_cr = str(meta.get("after_cr") or line[idx_cr:])
 
             tr = e.get("translation")
             if isinstance(tr, str) and tr != "":
-                body_txt = tr  # preserve exact spacing/tags user typed
+                body_txt = tr  # preserve exactly what user typed
             else:
                 body_txt = str(e.get("original") or "")
 
-            # Rebuild line exactly: prefix + body + post
-            lines[li] = f"{prefix}{body_txt}{post}"
+            lines[li] = f"{prefix}{body_txt}{after_cr}"
 
         return "".join(lines)
 
 
-plugin = KirikiriDialectParser()
+plugin = KirikiriParser()
