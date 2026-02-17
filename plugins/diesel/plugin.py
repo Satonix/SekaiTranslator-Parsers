@@ -35,8 +35,8 @@ RE_LOOKS_FUNC = re.compile(r"^(TransText|TransAddText|TransChoice|TransLog|Trans
 
 RE_HAS_LETTER = re.compile(r"[A-Za-zÀ-ÿ\u3040-\u30ff\u4e00-\u9fff]")
 
-RE_WS_LEAD = re.compile(r"^\s*")
-RE_WS_TAIL = re.compile(r"\s*$")
+RE_WS_LEAD = re.compile(r"^[ \t]*")   # não use \s para não engolir coisas estranhas
+RE_WS_TAIL = re.compile(r"[ \t]*$")
 
 
 # Quote pairs (external)
@@ -74,10 +74,6 @@ def _split_lead_tail_ws(s: str) -> tuple[str, str, str]:
 
 
 def strip_outer_quotes_same_line_keep_ws(s: str) -> tuple[str, str, str]:
-    """
-    Remove quote pair only if both are on the same line, preserving outer whitespace.
-    Example: '  " hi  "  ' => ('   hi    ', '"', '"')  (quotes removed, spaces preserved)
-    """
     lead, core, tail = _split_lead_tail_ws(s)
     for q1, q2 in QUOTE_PAIRS:
         if core.startswith(q1) and core.endswith(q2) and len(core) >= len(q1) + len(q2) + 1:
@@ -87,10 +83,6 @@ def strip_outer_quotes_same_line_keep_ws(s: str) -> tuple[str, str, str]:
 
 
 def strip_opening_quote_if_any_keep_ws(s: str) -> tuple[str, str, str]:
-    """
-    If (after leading whitespace) starts with opening quote, remove it.
-    Preserve all whitespace after the quote (do NOT lstrip).
-    """
     lead, core, tail = _split_lead_tail_ws(s)
     for q1, q2 in QUOTE_PAIRS:
         if core.startswith(q1) and len(core) >= len(q1) + 1:
@@ -100,10 +92,6 @@ def strip_opening_quote_if_any_keep_ws(s: str) -> tuple[str, str, str]:
 
 
 def strip_closing_quote_if_matches_keep_ws(s: str, q2: str) -> tuple[str, bool]:
-    """
-    If (before trailing whitespace) ends with q2, remove it.
-    Preserve outer whitespace.
-    """
     lead, core, tail = _split_lead_tail_ws(s)
     if core.endswith(q2) and len(core) >= len(q2) + 1:
         inner = core[: -len(q2)]
@@ -117,6 +105,7 @@ def strip_closing_quote_if_matches_keep_ws(s: str, q2: str) -> tuple[str, bool]:
 def build_tag_template(line: str) -> dict:
     """
     Splits a line into segments of tags and non-tags, preserving everything.
+    Additionally records which txt segments are "payload" (non-whitespace).
     Template is JSON-serializable.
     """
     segs: list[dict] = []
@@ -128,11 +117,19 @@ def build_tag_template(line: str) -> dict:
         last = m.end()
     if last < len(line):
         segs.append({"t": "txt", "v": line[last:]})
-    return {"segs": segs}
+
+    payload: list[int] = []
+    for i, s in enumerate(segs):
+        if s.get("t") != "txt":
+            continue
+        # payload = txt com algo além de whitespace
+        if (s.get("v") or "").strip() != "":
+            payload.append(i)
+
+    return {"segs": segs, "payload": payload}
 
 
 def template_visible_text(template: dict) -> str:
-    """Concatenate non-tag segments exactly (spaces preserved)."""
     out: list[str] = []
     for s in template.get("segs", []):
         if s.get("t") == "txt":
@@ -142,32 +139,40 @@ def template_visible_text(template: dict) -> str:
 
 def apply_translation_to_template(template: dict, translated_txt: str) -> str:
     """
-    Reconstruct line by keeping all tags, but replacing ALL non-tag text with:
-      (original leading ws) + translated_txt + (original trailing ws)
-    placed into the first non-tag segment; other txt segments become empty.
-    This preserves tag placement and preserves original outer indentation/trailing spaces.
+    Reconstruct line keeping ALL tags and ALL whitespace segments intact.
+
+    Strategy:
+      - Identify txt segments that carried real text (payload).
+      - Replace ONLY the FIRST payload segment with the translation,
+        preserving that segment's own leading/trailing spaces.
+      - For other payload segments: remove only their "core text" but keep their
+        internal leading/trailing whitespace (so spacing around tags stays identical).
+
+    This keeps translation inside the same tag-wrapped slot as the original.
     """
     segs = template.get("segs", [])
-    orig_txt = template_visible_text(template)
+    payload = template.get("payload", [])
 
-    lead = RE_WS_LEAD.match(orig_txt).group(0) if orig_txt else ""
-    tail = RE_WS_TAIL.search(orig_txt).group(0) if orig_txt else ""
+    if not isinstance(segs, list) or not segs:
+        return ""
 
-    new_txt = f"{lead}{translated_txt}{tail}"
+    if not payload:
+        # No visible text to replace
+        return "".join((s.get("v", "") for s in segs))
 
-    rebuilt: list[str] = []
-    placed = False
-    for s in segs:
-        if s.get("t") == "tag":
-            rebuilt.append(s.get("v", ""))
-            continue
-        # txt segment
-        if not placed:
-            rebuilt.append(new_txt)
-            placed = True
+    first_idx = payload[0]
+
+    for idx in payload:
+        v = segs[idx].get("v", "") or ""
+        lead, core, tail = _split_lead_tail_ws(v)
+
+        if idx == first_idx:
+            segs[idx]["v"] = f"{lead}{translated_txt}{tail}"
         else:
-            rebuilt.append("")
-    return "".join(rebuilt)
+            # remove only the text core; keep whitespace so spacing around tags remains
+            segs[idx]["v"] = f"{lead}{tail}"
+
+    return "".join((s.get("v", "") for s in segs))
 
 
 class DieselNutParser:
@@ -217,7 +222,6 @@ class DieselNutParser:
             raw = data[off + 4:end]
             text, enc = self._decode_with_tag(raw)
 
-            # Preserve newline style (used in rebuild)
             newline = "\r\n" if "\r\n" in text else "\n"
             out.append({"offset": off, "text": text, "enc": enc, "newline": newline})
             i += 4
@@ -236,36 +240,25 @@ class DieselNutParser:
         return name or None
 
     def _extract_visible_text_and_meta(self, raw_line: str) -> tuple[Optional[str], dict]:
-        """
-        Returns (visible_text_preserving_spaces, line_meta).
-        visible_text is whitespace-preserving (no strip()).
-        line_meta stores info needed to rebuild without losing tags/spaces.
-        """
-        # Fast emptiness check without altering content
         if not raw_line.strip():
             return None, {}
 
         s_stripped = raw_line.strip()
 
-        # skip comments
         if s_stripped.startswith("//"):
             return None, {}
 
-        # voice-only line
         if RE_VOICE_LINE.match(s_stripped):
             return None, {}
 
-        # control-tag-only line (unless it's <center>...</center>)
         if RE_CTRL_TAG_LINE.match(s_stripped) and not RE_CENTER.search(raw_line):
             return None, {}
 
-        # path-ish or function-ish (avoid junk entries)
         if RE_LOOKS_PATH.search(s_stripped):
             return None, {}
         if RE_LOOKS_FUNC.match(s_stripped):
             return None, {}
 
-        # center: extract inner but preserve its spaces (remove nested tags, but don't strip)
         m = RE_CENTER.search(raw_line)
         if m:
             inner_raw = m.group(1)
@@ -274,20 +267,15 @@ class DieselNutParser:
                 return None, {}
             if inner_plain.strip().lower() in {"main", "this"}:
                 return None, {}
-            meta = {
-                "line_kind": "center",
-                "center": True,
-            }
+            meta = {"line_kind": "center", "center": True}
             return inner_plain, meta
 
-        # Non-center: build template to preserve tags + original whitespace
         template = build_tag_template(raw_line)
-        plain = template_visible_text(template)  # exact, includes indentation/trailing spaces
+        plain = template_visible_text(template)
 
         if not plain.strip():
             return None, {}
 
-        # filter out trivial identifiers (use stripped copy for the test only)
         plain_chk = plain.strip()
         if (
             " " not in plain_chk
@@ -296,14 +284,10 @@ class DieselNutParser:
         ):
             return None, {}
 
-        # must have some letters (check stripped; but keep original)
         if not RE_HAS_LETTER.search(plain_chk):
             return None, {}
 
-        meta = {
-            "line_kind": "template",
-            "template": template,  # JSON-serializable
-        }
+        meta = {"line_kind": "template", "template": template}
         return plain, meta
 
     # --------------------------------------------------
@@ -340,7 +324,6 @@ class DieselNutParser:
             enc = b["enc"]
             nl = b.get("newline") or ("\r\n" if "\r\n" in b["text"] else "\n")
 
-            # Split preserving the original line boundaries for indexing
             lines = b["text"].split(nl)
 
             current_speaker: Optional[str] = None
@@ -350,7 +333,6 @@ class DieselNutParser:
                 if not raw_line.strip():
                     continue
 
-                # voice tag updates speaker
                 if RE_VOICE_LINE.match(raw_line.strip()):
                     sp = self._speaker_from_voice_line(raw_line)
                     if sp:
@@ -361,9 +343,6 @@ class DieselNutParser:
                 if visible is None:
                     continue
 
-                # --------
-                # Quotes: remove from editor text BUT preserve surrounding whitespace
-                # --------
                 q_pre = ""
                 q_suf = ""
 
@@ -403,7 +382,7 @@ class DieselNutParser:
                     {
                         "entry_id": f"{off}:{line_index}",
                         "speaker": current_speaker or "",
-                        "original": visible,  # whitespace preserved
+                        "original": visible,
                         "translation": "",
                         "status": "untranslated",
                         "is_translatable": True,
@@ -420,7 +399,6 @@ class DieselNutParser:
         data = self._read_bytes(ctx)
         out = bytearray(data)
 
-        # translations by (offset, line_index) => (text, q_pre, q_suf, line_kind, template?)
         tr_map: Dict[Tuple[int, int], Tuple[str, str, str, str, Optional[dict]]] = {}
 
         for e in entries:
@@ -446,7 +424,6 @@ class DieselNutParser:
 
         blocks = self._scan_blocks(data, limit=min(len(data), SCAN_LIMIT))
 
-        # Reverse to keep offsets stable while replacing variable-size blocks
         for b in reversed(blocks):
             off = int(b["offset"])
             enc = b["enc"]
@@ -471,13 +448,11 @@ class DieselNutParser:
 
                 new_text_only, q_pre, q_suf, line_kind, template = tr_map[key]
 
-                # restore quotes if the original had them
                 if q_pre:
                     new_text_only = f"{q_pre}{new_text_only}"
                 if q_suf:
                     new_text_only = f"{new_text_only}{q_suf}"
 
-                # center: replace inner content only, keep everything else (including spaces)
                 if RE_CENTER.search(orig_line):
                     new_lines.append(
                         RE_CENTER.sub(
@@ -488,13 +463,11 @@ class DieselNutParser:
                     )
                     continue
 
-                # template-tagged line: keep tags, preserve original outer ws from txt segments
                 if line_kind == "template" and isinstance(template, dict):
                     new_lines.append(apply_translation_to_template(template, new_text_only))
                     continue
 
-                # fallback: preserve original line's leading/trailing whitespace
-                # (useful if something wasn't templated)
+                # fallback: preserva lead/tail do original
                 lead = RE_WS_LEAD.match(orig_line).group(0) if orig_line else ""
                 tail = RE_WS_TAIL.search(orig_line).group(0) if orig_line else ""
                 new_lines.append(f"{lead}{new_text_only}{tail}")
