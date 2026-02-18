@@ -5,6 +5,7 @@ import re
 from typing import Iterator, Optional, Tuple
 
 from parsers.base import ParseContext
+from parsers.entries import make_entry
 
 
 class ArtemisParser:
@@ -24,8 +25,8 @@ class ArtemisParser:
     # Parse
     # --------------------------------------------------
     def parse(self, ctx: ParseContext, text: str) -> list[dict]:
-        project = ctx.project
-        src_lang = (project.get("source_language") or "ja").strip()
+        project = getattr(ctx, "project", None) or {}
+        src_lang = (project.get("source_language") or "ja").strip() or "ja"
 
         entries: list[dict] = []
 
@@ -58,20 +59,20 @@ class ArtemisParser:
                 continue
 
             for tok in found:
-                entry_id = f"{inner_start_abs}:{tok['span_abs'][0]}:{tok['span_abs'][1]}"
+                span = tok["span_abs"]
+                entry_id = f"{inner_start_abs}:{span[0]}:{span[1]}"
+
                 entries.append(
-                    {
-                        "entry_id": entry_id,
-                        "original": tok["text_for_editor"],
-                        "translation": "",
-                        "status": "untranslated",
-                        "is_translatable": True,
-                        "meta": {
-                            "span_abs": tok["span_abs"],
+                    make_entry(
+                        entry_id=entry_id,
+                        original=tok["text_for_editor"],
+                        speaker="",
+                        meta={
+                            "span_abs": span,
                             "token_kind": tok["kind"],               # "quoted" | "long"
                             "long_style": tok.get("long_style", ""), # "plain"|"wrapped"|"leading_quote"
                         },
-                    }
+                    )
                 )
 
         return entries
@@ -88,6 +89,7 @@ class ArtemisParser:
                 return int(span[0])
             return -1
 
+        # reverse=True para não invalidar spans ao substituir
         for e in sorted(entries, key=_key, reverse=True):
             tr = e.get("translation")
             if not isinstance(tr, str):
@@ -118,7 +120,6 @@ class ArtemisParser:
                     inner = f"\"{self._escape_lua_string(tr)}\""
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
-
                 else:
                     # plain OU leading_quote: exporta SEM aspas internas
                     inner = tr
@@ -207,19 +208,12 @@ class ArtemisParser:
                 if lb is not None:
                     start, end, raw_inner = lb
 
-                    # Normaliza para análise
                     ltrim = raw_inner.lstrip()
                     rtrim = raw_inner.rstrip()
 
                     # 1) [[ "texto" ]]  -> wrapped
                     if ltrim.startswith('"') and rtrim.endswith('"'):
-                        inner_quoted = ltrim[1:]
-                        # remove o ÚLTIMO " (do rtrim) preservando resto
-                        # (equivalente a pegar conteúdo entre as aspas externas)
-                        # Usa rtrim para achar o fim, mas devolve texto "limpo" pro editor.
-                        inner_between = (ltrim[1:])  # sem a primeira "
-                        # corta a última " do rtrim em relação ao ltrim
-                        # (garante que fecha na última aspa da direita)
+                        inner_between = ltrim[1:]
                         pos_last_quote = inner_between.rfind('"')
                         if pos_last_quote >= 0:
                             inner_between = inner_between[:pos_last_quote]
@@ -232,14 +226,13 @@ class ArtemisParser:
                         i = end
                         continue
 
-                    # 2) [[ "texto... ]] -> leading_quote (seu caso)
+                    # 2) [[ "texto... ]] -> leading_quote
                     if ltrim.startswith('"') and not rtrim.endswith('"'):
-                        # remove só a primeira aspa para o editor
                         yield {
                             "kind": "long",
                             "long_style": "leading_quote",
                             "span_abs": (base_abs + start, base_abs + end),
-                            "text_for_editor": ltrim[1:],  # sem a primeira "
+                            "text_for_editor": ltrim[1:],
                         }
                         i = end
                         continue
