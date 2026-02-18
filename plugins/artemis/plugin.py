@@ -70,7 +70,7 @@ class ArtemisParser:
                         meta={
                             "span_abs": span,
                             "token_kind": tok["kind"],               # "quoted" | "long"
-                            "long_style": tok.get("long_style", ""), # "plain"|"wrapped"|"leading_quote"
+                            "long_style": tok.get("long_style", ""), # "plain"|"wrapped"|"leading_quote"|"trailing_quote"
                         },
                     )
                 )
@@ -120,7 +120,7 @@ class ArtemisParser:
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
                 else:
-                    # plain OU leading_quote: exporta sem aspas externas
+                    # plain | leading_quote | trailing_quote: exporta sem aspas externas
                     inner = tr
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
@@ -206,20 +206,12 @@ class ArtemisParser:
                 if lb is not None:
                     start, end, raw_inner = lb
 
-                    # FIX robusto: remove aspas externas de forma segura preservando newlines
                     style, editor_text = self._strip_outer_quotes_preserve(raw_inner)
 
-                    if style == "wrapped":
+                    if style in ("wrapped", "leading_quote", "trailing_quote"):
                         yield {
                             "kind": "long",
-                            "long_style": "wrapped",
-                            "span_abs": (base_abs + start, base_abs + end),
-                            "text_for_editor": self._unescape_lua_string(editor_text),
-                        }
-                    elif style == "leading_quote":
-                        yield {
-                            "kind": "long",
-                            "long_style": "leading_quote",
+                            "long_style": style,
                             "span_abs": (base_abs + start, base_abs + end),
                             "text_for_editor": self._unescape_lua_string(editor_text),
                         }
@@ -238,43 +230,54 @@ class ArtemisParser:
 
     def _strip_outer_quotes_preserve(self, raw_inner: str) -> tuple[str, str]:
         """
-        Detecta aspas externas dentro de raw_inner (conteúdo do long bracket),
-        ignorando whitespace nas pontas, e remove:
-        - se houver " ... " -> wrapped (remove ambos)
-        - se houver só aspas iniciais -> leading_quote (remove só a inicial)
-        - caso contrário -> plain
-        Preserva quebras de linha e whitespace internos.
+        Remove aspas externas dentro do conteúdo do long bracket preservando newlines.
+
+        Casos:
+        - wrapped:   primeiro não-whitespace é "  E  último não-whitespace é "
+        - leading:  primeiro não-whitespace é "  e  último não-whitespace NÃO é "
+        - trailing: primeiro não-whitespace NÃO é "  e  último não-whitespace é "
+        - plain:    nenhum dos dois
         """
         n = len(raw_inner)
         if n == 0:
             return "plain", ""
 
-        # achar primeiro char não-whitespace
+        # primeiro não-whitespace
         l = 0
         while l < n and raw_inner[l].isspace():
             l += 1
-        if l >= n or raw_inner[l] != '"':
-            return "plain", ""
 
-        # achar último char não-whitespace
+        # último não-whitespace
         r = n - 1
         while r >= 0 and raw_inner[r].isspace():
             r -= 1
-        if r <= l:
-            # só uma aspa e/ou whitespace
-            # remove a inicial
-            return "leading_quote", raw_inner[:l] + raw_inner[l + 1 :]
 
-        if raw_inner[r] == '"':
-            # wrapped: remove inicial e final, preservando whitespace fora delas
-            without_first = raw_inner[:l] + raw_inner[l + 1 :]
-            # após remover a primeira, o índice r muda se r > l
+        if l >= n or r < 0 or r < l:
+            return "plain", ""
+
+        has_leading = raw_inner[l] == '"'
+        has_trailing = raw_inner[r] == '"'
+
+        if has_leading and has_trailing and r > l:
+            # remove as duas
+            # remove leading
+            tmp = raw_inner[:l] + raw_inner[l + 1 :]
+            # ajustar índice do trailing após remoção do leading
             r2 = r - 1
-            # remove a última " (agora em r2, ignorando whitespace não muda)
-            return "wrapped", without_first[:r2] + without_first[r2 + 1 :]
+            tmp = tmp[:r2] + tmp[r2 + 1 :]
+            return "wrapped", tmp
 
-        # leading_quote: remove só a inicial (a final não é externa)
-        return "leading_quote", raw_inner[:l] + raw_inner[l + 1 :]
+        if has_leading and not has_trailing:
+            # remove só a inicial
+            tmp = raw_inner[:l] + raw_inner[l + 1 :]
+            return "leading_quote", tmp
+
+        if (not has_leading) and has_trailing:
+            # remove só a final (esse é o caso que estava sobrando " no fim)
+            tmp = raw_inner[:r] + raw_inner[r + 1 :]
+            return "trailing_quote", tmp
+
+        return "plain", ""
 
     def _try_parse_long_bracket(self, s: str, i: int) -> Optional[Tuple[int, int, str]]:
         n = len(s)
