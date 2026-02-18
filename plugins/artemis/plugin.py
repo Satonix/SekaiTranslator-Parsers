@@ -115,10 +115,12 @@ class ArtemisParser:
                 style = (meta.get("long_style") or "plain").strip() or "plain"
 
                 if style == "wrapped":
+                    # exporta [[ "..." ]] (aspas externas)
                     inner = f"\"{self._escape_lua_string(tr)}\""
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
                 else:
+                    # plain OU leading_quote: exporta sem aspas externas
                     inner = tr
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
@@ -197,61 +199,82 @@ class ArtemisParser:
                 continue
 
             # -----------------------
-            # Long bracket
+            # Long bracket: [=*[ ... ]=*]
             # -----------------------
             if ch == "[":
                 lb = self._try_parse_long_bracket(s, i)
                 if lb is not None:
                     start, end, raw_inner = lb
 
-                    ltrim = raw_inner.lstrip()
-                    rtrim = raw_inner.rstrip()
+                    # FIX robusto: remove aspas externas de forma segura preservando newlines
+                    style, editor_text = self._strip_outer_quotes_preserve(raw_inner)
 
-                    # 1) [[ "texto" ]]  -> wrapped
-                    if ltrim.startswith('"') and rtrim.endswith('"'):
-                        inner_between = ltrim[1:]
-                        pos_last_quote = inner_between.rfind('"')
-                        if pos_last_quote >= 0:
-                            inner_between = inner_between[:pos_last_quote]
+                    if style == "wrapped":
                         yield {
                             "kind": "long",
                             "long_style": "wrapped",
                             "span_abs": (base_abs + start, base_abs + end),
-                            "text_for_editor": self._unescape_lua_string(inner_between),
+                            "text_for_editor": self._unescape_lua_string(editor_text),
                         }
-                        i = end
-                        continue
-
-                    # 2) [[ "texto... ]] -> leading_quote (FIX aplicado)
-                    if ltrim.startswith('"') and not rtrim.endswith('"'):
-                        editor_text = ltrim[1:]
-
-                        # remove a última aspa se ela estiver no final (mesmo multi-linha)
-                        stripped = editor_text.rstrip()
-                        if stripped.endswith('"'):
-                            cut = len(stripped) - 1
-                            editor_text = stripped[:cut] + editor_text[len(stripped):]
-
+                    elif style == "leading_quote":
                         yield {
                             "kind": "long",
                             "long_style": "leading_quote",
                             "span_abs": (base_abs + start, base_abs + end),
-                            "text_for_editor": editor_text,
+                            "text_for_editor": self._unescape_lua_string(editor_text),
                         }
-                        i = end
-                        continue
+                    else:
+                        yield {
+                            "kind": "long",
+                            "long_style": "plain",
+                            "span_abs": (base_abs + start, base_abs + end),
+                            "text_for_editor": raw_inner,
+                        }
 
-                    # 3) [[ texto ]] -> plain
-                    yield {
-                        "kind": "long",
-                        "long_style": "plain",
-                        "span_abs": (base_abs + start, base_abs + end),
-                        "text_for_editor": raw_inner,
-                    }
                     i = end
                     continue
 
             i += 1
+
+    def _strip_outer_quotes_preserve(self, raw_inner: str) -> tuple[str, str]:
+        """
+        Detecta aspas externas dentro de raw_inner (conteúdo do long bracket),
+        ignorando whitespace nas pontas, e remove:
+        - se houver " ... " -> wrapped (remove ambos)
+        - se houver só aspas iniciais -> leading_quote (remove só a inicial)
+        - caso contrário -> plain
+        Preserva quebras de linha e whitespace internos.
+        """
+        n = len(raw_inner)
+        if n == 0:
+            return "plain", ""
+
+        # achar primeiro char não-whitespace
+        l = 0
+        while l < n and raw_inner[l].isspace():
+            l += 1
+        if l >= n or raw_inner[l] != '"':
+            return "plain", ""
+
+        # achar último char não-whitespace
+        r = n - 1
+        while r >= 0 and raw_inner[r].isspace():
+            r -= 1
+        if r <= l:
+            # só uma aspa e/ou whitespace
+            # remove a inicial
+            return "leading_quote", raw_inner[:l] + raw_inner[l + 1 :]
+
+        if raw_inner[r] == '"':
+            # wrapped: remove inicial e final, preservando whitespace fora delas
+            without_first = raw_inner[:l] + raw_inner[l + 1 :]
+            # após remover a primeira, o índice r muda se r > l
+            r2 = r - 1
+            # remove a última " (agora em r2, ignorando whitespace não muda)
+            return "wrapped", without_first[:r2] + without_first[r2 + 1 :]
+
+        # leading_quote: remove só a inicial (a final não é externa)
+        return "leading_quote", raw_inner[:l] + raw_inner[l + 1 :]
 
     def _try_parse_long_bracket(self, s: str, i: int) -> Optional[Tuple[int, int, str]]:
         n = len(s)
