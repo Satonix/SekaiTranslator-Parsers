@@ -89,7 +89,6 @@ class ArtemisParser:
                 return int(span[0])
             return -1
 
-        # reverse=True para não invalidar spans ao substituir
         for e in sorted(entries, key=_key, reverse=True):
             tr = e.get("translation")
             if not isinstance(tr, str):
@@ -116,18 +115,15 @@ class ArtemisParser:
                 style = (meta.get("long_style") or "plain").strip() or "plain"
 
                 if style == "wrapped":
-                    # preserva o estilo [[ "..." ]] (aspas internas completas)
                     inner = f"\"{self._escape_lua_string(tr)}\""
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
                 else:
-                    # plain OU leading_quote: exporta SEM aspas internas
                     inner = tr
                     open_, close = self._make_safe_long_brackets(inner)
                     replacement = f"{open_}{inner}{close}"
 
             else:
-                # fallback seguro
                 replacement = f"\"{self._escape_lua_string(tr)}\""
 
             out = out[:a] + replacement + out[b:]
@@ -201,7 +197,7 @@ class ArtemisParser:
                 continue
 
             # -----------------------
-            # Long bracket: [=*[ ... ]=*]
+            # Long bracket
             # -----------------------
             if ch == "[":
                 lb = self._try_parse_long_bracket(s, i)
@@ -226,13 +222,21 @@ class ArtemisParser:
                         i = end
                         continue
 
-                    # 2) [[ "texto... ]] -> leading_quote
+                    # 2) [[ "texto... ]] -> leading_quote (FIX aplicado)
                     if ltrim.startswith('"') and not rtrim.endswith('"'):
+                        editor_text = ltrim[1:]
+
+                        # remove a última aspa se ela estiver no final (mesmo multi-linha)
+                        stripped = editor_text.rstrip()
+                        if stripped.endswith('"'):
+                            cut = len(stripped) - 1
+                            editor_text = stripped[:cut] + editor_text[len(stripped):]
+
                         yield {
                             "kind": "long",
                             "long_style": "leading_quote",
                             "span_abs": (base_abs + start, base_abs + end),
-                            "text_for_editor": ltrim[1:],
+                            "text_for_editor": editor_text,
                         }
                         i = end
                         continue
