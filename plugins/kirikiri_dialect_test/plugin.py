@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 from parsers.base import ParseContext
+
 
 _RX_COMMENT = re.compile(r"^\s*;")          # ; comment (inclui ;;)
 _RX_LABEL = re.compile(r"^\s*\*")           # *label or *|
 _RX_INLINE_CMD = re.compile(r"^\s*@")       # @font etc
-_RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+$")  # only [tags] on the line
 
+# Linha inteira composta somente por [tags] (com ou sem espaços)
+_RX_TAG_ONLY = re.compile(r"^\s*(?:\[[^\]]+\]\s*)+(?:\r?\n)?$")
+
+# [P_NAME s_cn="Subaru"]
 _RX_SPEAKER = re.compile(
     r"""\[\s*P_NAME\b[^]]*?\bs_cn\s*=\s*"([^"]+)"[^]]*]""",
     re.IGNORECASE,
@@ -36,8 +40,12 @@ def _is_translatable_body(body: str) -> bool:
     return tmp.strip() != ""
 
 
-def _find_first_break_tag(line: str) -> tuple[int, str] | tuple[int, str]:
-    """Retorna (idx, tag) para o primeiro [r]/[cr] mais cedo; (-1, '') se não tiver."""
+def _find_first_break_tag(line: str) -> tuple[int, str]:
+    """
+    Retorna (idx, tag) para o primeiro [r]/[cr] mais cedo; (-1, '') se não tiver.
+    Observação: este jogo frequentemente usa [r][cr] juntos. Preferimos [r] se ele
+    vier antes; o restante (incluindo [cr]) fica preservado no after_tag.
+    """
     idx_r = line.find("[r]")
     idx_cr = line.find("[cr]")
     if idx_r < 0 and idx_cr < 0:
@@ -80,6 +88,9 @@ class KirikiriDialectTestParser:
         Dialeto do jogo:
         - Texto pode estar em múltiplas linhas antes de aparecer [r]/[cr].
         - Pode haver linhas @font/@... no meio da fala.
+        - Pode haver linhas só de [tags] (ex: [cm], [playbgm ...], [TL ...]) entre falas.
+          Essas NÃO são traduzíveis e não devem aparecer na tabela; elas são anexadas
+          como prefixo pendente ao próximo bloco de texto, para round-trip perfeito.
         - Um entry == um terminador encontrado ([r] ou [cr]).
         """
         entries: list[dict] = []
@@ -87,16 +98,28 @@ class KirikiriDialectTestParser:
 
         current_speaker: str = ""
 
+        # Prefixo pendente: linhas de comando entre falas (tag-only e @cmd)
+        pending_prefix: list[dict] = []
+
         # Buffer do "bloco" atual até achar [r]/[cr]
-        buf_span: list[dict] = []   # elementos: {"kind":"text"/"cmd", ...}
-        buf_text_parts: list[str] = []
+        buf_span: list[dict] = []         # itens para round-trip (raw/cmd/text/text_mid)
+        buf_text_parts: list[str] = []    # apenas texto (para original)
         buf_text_line_count = 0
         buf_start_line: Optional[int] = None
 
-        def flush_if_break(end_tag_line_index: int, end_tag: str, after_tag: str) -> None:
-            nonlocal buf_span, buf_text_parts, buf_text_line_count, buf_start_line, entries
+        def _start_block_if_needed(start_line: int) -> None:
+            nonlocal buf_start_line, pending_prefix, buf_span
             if buf_start_line is None:
-                # não começou bloco, nada a flush
+                buf_start_line = start_line
+                if pending_prefix:
+                    buf_span.extend(pending_prefix)
+                    pending_prefix = []
+
+        def _flush(end_tag_line_index: int, end_tag: str, after_tag: str) -> None:
+            nonlocal buf_span, buf_text_parts, buf_text_line_count, buf_start_line, entries
+
+            if buf_start_line is None:
+                # Nada para flush
                 buf_span = []
                 buf_text_parts = []
                 buf_text_line_count = 0
@@ -118,14 +141,14 @@ class KirikiriDialectTestParser:
                             "start_line": buf_start_line,
                             "end_line": end_tag_line_index,
                             "text_line_count": buf_text_line_count,
-                            "span": buf_span,   # round-trip
+                            "span": buf_span,
                             "end_tag": end_tag,
                             "after_tag": after_tag,
                         },
                     }
                 )
 
-            # reset buffer
+            # reset
             buf_span = []
             buf_text_parts = []
             buf_text_line_count = 0
@@ -144,58 +167,61 @@ class KirikiriDialectTestParser:
             if _RX_COMMENT.match(line):
                 continue
 
-            # Se for linha @cmd, ela pode estar dentro de um bloco de fala.
+            # Linha só de tags (comandos)
+            if _RX_TAG_ONLY.match(line):
+                pending_prefix.append({"kind": "raw", "line_index": i, "raw": line})
+                continue
+
+            # Linha @cmd (comandos)
             if _RX_INLINE_CMD.match(line):
-                # só guarda se já estamos dentro de um bloco (buf_start_line != None)
-                if buf_start_line is not None:
-                    buf_span.append({"kind": "cmd", "line_index": i, "raw": line})
+                pending_prefix.append({"kind": "raw", "line_index": i, "raw": line})
                 continue
 
             # Procura terminador na linha
             idx_tag, tag = _find_first_break_tag(line)
             if idx_tag >= 0:
-                # Parte antes do terminador é texto (mesmo que vazio)
                 before_tag = line[:idx_tag]
                 after_tag = line[idx_tag:]  # inclui [r]/[cr] e o resto (incl \n)
 
                 prefix, body = _split_leading_ws(before_tag)
 
-                # Inicia bloco se necessário
-                if buf_start_line is None:
-                    buf_start_line = i
+                _start_block_if_needed(i)
 
-                # Adiciona a última linha de texto do bloco
+                # Última linha de texto do bloco: carrega o after_tag
                 buf_span.append(
                     {
                         "kind": "text",
                         "line_index": i,
                         "prefix": prefix,
-                        "suffix": after_tag,     # última linha carrega o after_tag
+                        "suffix": after_tag,
                     }
                 )
                 buf_text_parts.append(body.rstrip("\n"))
                 buf_text_line_count += 1
 
-                # Fecha bloco
-                flush_if_break(i, tag, after_tag)
+                _flush(i, tag, after_tag)
                 continue
 
-            # Linha de texto sem terminador (continuação do bloco OU ignora se fora de bloco)
-            # Regra: se tem conteúdo útil, entra no bloco.
+            # Linha de texto sem terminador (continuação do bloco)
             lead_ws, rest = _split_leading_ws(line)
             text_no_nl = rest.rstrip("\n")
 
-            # Se for vazia, só mantém se já estamos no bloco (preservar espaçamento)
+            # Se estiver vazio, só preserva se já estamos num bloco (não cria bloco novo)
             if text_no_nl.strip() == "":
                 if buf_start_line is not None:
                     buf_span.append({"kind": "raw", "line_index": i, "raw": line})
+                else:
+                    # fora de bloco: ignore
+                    pass
                 continue
 
-            # Inicia bloco se necessário
-            if buf_start_line is None:
-                buf_start_line = i
+            # Segurança extra: se por acaso for tag-only (sem newline), trate como prefixo
+            if _RX_TAG_ONLY.match(line):
+                pending_prefix.append({"kind": "raw", "line_index": i, "raw": line})
+                continue
 
-            # Guarda como linha de texto intermediária (suffix = "\n" original)
+            _start_block_if_needed(i)
+
             buf_span.append(
                 {
                     "kind": "text_mid",
@@ -238,19 +264,21 @@ class KirikiriDialectTestParser:
             else:
                 full_txt = str(e.get("original") or "")
 
-            # Split da tradução em linhas para casar com o número de linhas de texto originais
-            text_line_count = int(meta.get("text_line_count") or 1)
+            # Split em linhas para casar com o número de linhas de texto originais do bloco
+            try:
+                text_line_count = int(meta.get("text_line_count") or 1)
+            except Exception:
+                text_line_count = 1
+
             tr_lines = full_txt.split("\n")
 
             if len(tr_lines) < text_line_count:
                 tr_lines = tr_lines + [""] * (text_line_count - len(tr_lines))
             elif len(tr_lines) > text_line_count:
-                # junta excesso na última linha (não cria linhas físicas novas)
                 head = tr_lines[: text_line_count - 1]
                 tail = "\n".join(tr_lines[text_line_count - 1 :])
                 tr_lines = head + [tail]
 
-            # Percorre o span e reescreve só as linhas de texto, preservando @cmd/raw
             tpos = 0
             for item in span:
                 li = int(item.get("line_index"))
@@ -258,9 +286,8 @@ class KirikiriDialectTestParser:
                     continue
 
                 kind = item.get("kind")
-                if kind == "cmd":
-                    # mantém raw original (já está em ctx.original_text)
-                    continue
+
+                # raw: mantém como está no ctx.original_text
                 if kind == "raw":
                     continue
 
